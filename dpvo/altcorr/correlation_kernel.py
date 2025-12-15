@@ -204,8 +204,12 @@ def corr_torch_forward(
     ii,
     jj,
     radius,
-    chunk_size=256,   # << key parameter
-):
+    chunk_size=64,   # << key parameter
+):  
+    # fmap1 = fmap1.half()
+    # fmap2 = fmap2.half()
+    # coords = coords.half()
+
     device = fmap1.device
     dtype = fmap1.dtype
 
@@ -281,6 +285,88 @@ def corr_torch_forward(
 
     return out.permute(0, 1, 3, 2, 4, 5)
 
+
+def corr_torch_forward_fp16(
+    fmap1, fmap2, coords, ii, jj, radius, chunk_size=256
+):
+    """
+    FP16, chunked, GPU-friendly correlation for DPVO.
+    Returns: [B, M, D-1, D-1, H, W]
+    """
+    device = fmap1.device
+    dtype = torch.half  # Force FP16
+
+    B, M, _, H, W = coords.shape
+    C = fmap1.size(2)
+    H2, W2 = fmap2.size(3), fmap2.size(4)
+    D = 2 * radius + 2
+
+    # Ensure tensors are FP16
+    fmap1 = fmap1.half()
+    fmap2 = fmap2.half()
+    coords = coords.half()
+
+    # output
+    corr = torch.empty((B, M, D, D, H, W), device=device, dtype=dtype)
+
+    # offsets
+    offs = torch.arange(-radius, radius + 2, device=device, dtype=dtype)
+    oy, ox = torch.meshgrid(offs, offs, indexing='ij')  # [D,D]
+    ox = ox.view(1, 1, D, D, 1, 1)
+    oy = oy.view(1, 1, D, D, 1, 1)
+
+    # process in chunks
+    for m0 in range(0, M, chunk_size):
+        m1 = min(m0 + chunk_size, M)
+        mc = m1 - m0
+
+        ii_c = ii[m0:m1]
+        jj_c = jj[m0:m1]
+
+        f1 = fmap1[:, ii_c]        # [B, mc, C, H, W]
+        f2 = fmap2[:, jj_c]        # [B, mc, C, H2, W2]
+
+        x = coords[:, m0:m1, 0]
+        y = coords[:, m0:m1, 1]
+
+        x0 = torch.floor(x)
+        y0 = torch.floor(y)
+
+        # grid for sampling
+        gx = x0.unsqueeze(2).unsqueeze(2) + ox  # [B, mc, D, D, H, W]
+        gy = y0.unsqueeze(2).unsqueeze(2) + oy
+
+        gx = 2 * gx / (W2 - 1) - 1
+        gy = 2 * gy / (H2 - 1) - 1
+
+        grid = torch.stack([gx, gy], dim=-1).view(B * mc, D * D * H * W, 1, 2)
+        f2_view = f2.view(B * mc, C, H2, W2)
+
+        sampled = F.grid_sample(
+            f2_view, grid, mode='bilinear', align_corners=True
+        )  # [B*mc, C, D*D*H*W, 1]
+
+        sampled = sampled.view(B, mc, C, D, D, H, W)
+
+        # dot product over channels
+        f1e = f1.unsqueeze(3).unsqueeze(3)  # [B, mc, C, 1, 1, H, W]
+        corr[:, m0:m1] = (f1e * sampled).sum(dim=2)
+
+    # ---- wrapper bilinear interpolation ----
+    dx = (coords[:, :, 0] - torch.floor(coords[:, :, 0])).unsqueeze(2).unsqueeze(2)
+    dy = (coords[:, :, 1] - torch.floor(coords[:, :, 1])).unsqueeze(2).unsqueeze(2)
+
+    dx = dx.half()
+    dy = dy.half()
+
+    out = (
+        (1 - dx) * (1 - dy) * corr[:, :, 0:D-1, 0:D-1]
+        + dx * (1 - dy)     * corr[:, :, 0:D-1, 1:D]
+        + (1 - dx) * dy     * corr[:, :, 1:D, 0:D-1]
+        + dx * dy           * corr[:, :, 1:D, 1:D]
+    )
+
+    return out.permute(0, 1, 3, 2, 4, 5)
 
 
 

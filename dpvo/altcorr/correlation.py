@@ -1,11 +1,13 @@
 import torch
 import cuda_corr
+from torch.cuda.amp import autocast
 from .correlation_kernel import ( 
 patchify_python_forward,
 patchify_python_backward, 
 corr_torch_forward,
 corr_backward_kernel, 
 corr_cuda_backward,
+corr_torch_forward_fp16
 )
 
 
@@ -18,17 +20,18 @@ class CorrLayer(torch.autograd.Function):
         ctx.dropout = dropout
         
         # Print shapes and parameter values for debugging
-        print("=== CorrLayer.forward Debug ===")
-        print(f"fmap1 shape: {tuple(fmap1.shape)}")
-        print(f"fmap2 shape: {tuple(fmap2.shape)}")
-        print(f"coords shape: {tuple(coords.shape)}")
-        print(f"ii shape: {tuple(ii.shape)}, min={ii.min().item()}, max={ii.max().item()}")
-        print(f"jj shape: {tuple(jj.shape)}, min={jj.min().item()}, max={jj.max().item()}")
-        print(f"radius: {radius}")
-        print(f"dropout: {dropout}")
-        print("===============================")
+        # print("=== CorrLayer.forward Debug ===")
+        # print(f"fmap1 shape: {tuple(fmap1.shape)}")
+        # print(f"fmap2 shape: {tuple(fmap2.shape)}")
+        # print(f"coords shape: {tuple(coords.shape)}")
+        # print(f"ii shape: {tuple(ii.shape)}, min={ii.min().item()}, max={ii.max().item()}")
+        # print(f"jj shape: {tuple(jj.shape)}, min={jj.min().item()}, max={jj.max().item()}")
+        # print(f"radius: {radius}")
+        # print(f"dropout: {dropout}")
+        # print("===============================")
         # corr, = cuda_corr.forward(fmap1, fmap2, coords, ii, jj, radius)
-        corr, = corr_torch_forward(fmap1, fmap2, coords, ii, jj, radius)
+        with autocast(enabled=True, dtype=torch.half):
+            corr, = corr_torch_forward_fp16(fmap1, fmap2, coords, ii, jj, radius)
 
         return corr
 
