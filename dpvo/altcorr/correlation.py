@@ -3,7 +3,7 @@ import cuda_corr
 from .correlation_kernel import ( 
 patchify_python_forward,
 patchify_python_backward, 
-corr_cuda_forward, 
+corr_torch_forward,
 corr_backward_kernel, 
 corr_cuda_backward,
 )
@@ -18,17 +18,17 @@ class CorrLayer(torch.autograd.Function):
         ctx.dropout = dropout
         
         # Print shapes and parameter values for debugging
-        # print("=== CorrLayer.forward Debug ===")
-        # print(f"fmap1 shape: {tuple(fmap1.shape)}")
-        # print(f"fmap2 shape: {tuple(fmap2.shape)}")
-        # print(f"coords shape: {tuple(coords.shape)}")
-        # print(f"ii shape: {tuple(ii.shape)}, min={ii.min().item()}, max={ii.max().item()}")
-        # print(f"jj shape: {tuple(jj.shape)}, min={jj.min().item()}, max={jj.max().item()}")
-        # print(f"radius: {radius}")
-        # print(f"dropout: {dropout}")
-        # print("===============================")
-        corr, = cuda_corr.forward(fmap1, fmap2, coords, ii, jj, radius)
-        # corr, = corr_cuda_forward(fmap1, fmap2, coords, ii, jj, radius)
+        print("=== CorrLayer.forward Debug ===")
+        print(f"fmap1 shape: {tuple(fmap1.shape)}")
+        print(f"fmap2 shape: {tuple(fmap2.shape)}")
+        print(f"coords shape: {tuple(coords.shape)}")
+        print(f"ii shape: {tuple(ii.shape)}, min={ii.min().item()}, max={ii.max().item()}")
+        print(f"jj shape: {tuple(jj.shape)}, min={jj.min().item()}, max={jj.max().item()}")
+        print(f"radius: {radius}")
+        print(f"dropout: {dropout}")
+        print("===============================")
+        # corr, = cuda_corr.forward(fmap1, fmap2, coords, ii, jj, radius)
+        corr, = corr_torch_forward(fmap1, fmap2, coords, ii, jj, radius)
 
         return corr
 
@@ -113,7 +113,7 @@ def patchify_forward(net: torch.Tensor, coords: torch.Tensor, radius: int):
         patches : Tensor or tuple of Tensors
     """
     # Call the underlying CUDA function (assume already implemented in Python/CUDA)
-    patches = patchify_cuda_forward(net, coords, radius)
+    patches = patchify_python_forward(net, coords, radius)
     # Return as tuple for consistency with C++ std::vector
     return (patches,)
 
@@ -131,5 +131,5 @@ def patchify_backward(net: torch.Tensor, coords: torch.Tensor, grad: torch.Tenso
     Returns:
         grad_net : Tensor or tuple
     """
-    grad_net = patchify_cuda_backward(net, coords, grad, radius)
+    grad_net = patchify_python_backward(net, coords, grad, radius)
     return (grad_net,)
