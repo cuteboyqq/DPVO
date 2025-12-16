@@ -73,17 +73,21 @@ class Update(nn.Module):
 
     def forward(self, net, inp, corr, flow, ii, jj, kk):
         """ update operator """
-
+        # Residual Fusion 
         net = net + inp + self.corr(corr)
+        # Layer Norm
         net = self.norm(net)
-
+        # Gives the indices of neighboring nodes/patches for each element in kk and jj. 
+        # These are then used to perform neighbor-based updates in the network.
         ix, jx = fastba.neighbors(kk, jj)
         mask_ix = (ix >= 0).float().reshape(1, -1, 1)
         mask_jx = (jx >= 0).float().reshape(1, -1, 1)
-
+        
+        # Neighbor Update:  
         net = net + self.c1(mask_ix * net[:,ix])
         net = net + self.c2(mask_jx * net[:,jx])
 
+        # Soft Aggregation:   
         net = net + self.agg_kk(net, kk)
         net = net + self.agg_ij(net, ii*12345 + jj)
 
@@ -271,3 +275,314 @@ class VONet(nn.Module):
 
         return traj
 
+
+#=====================================================================================================================
+# Alister add 2025-12-15 for convert update model into onnx
+
+def neighbors_tensor(ii: torch.Tensor, jj: torch.Tensor):
+    """
+    Fully tensorized neighbors computation (ONNX-compatible, int64 safe)
+    """
+    N = ii.shape[0]
+
+    # unique segments and inverse mapping
+    uniq, inv = torch.unique(ii, sorted=True, return_inverse=True)  # uniq: [M], inv: [N]
+
+    # mask for same segment
+    segment_mask = inv.unsqueeze(0) == inv.unsqueeze(1)  # [N, N]
+
+    # broadcast jj for comparisons
+    jj_row = jj.unsqueeze(0).expand(N, N)
+    jj_col = jj.unsqueeze(1).expand(N, N)
+
+    LARGE = 1_000_000  # placeholder for "no neighbor"
+    SMALL = -1_000_000
+
+    jj_row = torch.where(segment_mask, jj_row, torch.full_like(jj_row, LARGE))
+
+    # previous neighbor
+    prev_mask = jj_row < jj.unsqueeze(1)
+    prev_jj = torch.where(prev_mask, jj_row, torch.full_like(jj_row, SMALL))
+    ix = torch.argmax(prev_jj, dim=1)
+    ix = torch.where(prev_mask.any(dim=1), ix, torch.full_like(ix, -1))
+
+    # next neighbor
+    next_mask = jj_row > jj.unsqueeze(1)
+    next_jj = torch.where(next_mask, jj_row, torch.full_like(jj_row, LARGE))
+    jx = torch.argmin(next_jj, dim=1)
+    jx = torch.where(next_mask.any(dim=1), jx, torch.full_like(jx, -1))
+
+    return ix.to(torch.int64), jx.to(torch.int64)
+
+class UpdateONNX(nn.Module):
+    def __init__(self, p):
+        super(UpdateONNX, self).__init__()
+        self.c1 = nn.Sequential(nn.Linear(DIM, DIM), nn.ReLU(inplace=True), nn.Linear(DIM, DIM))
+        self.c2 = nn.Sequential(nn.Linear(DIM, DIM), nn.ReLU(inplace=True), nn.Linear(DIM, DIM))
+        self.norm = nn.LayerNorm(DIM, eps=1e-3)
+        self.agg_kk = SoftAggONNX(DIM)
+        self.agg_ij = SoftAggONNX(DIM)
+        self.gru = nn.Sequential(
+            nn.LayerNorm(DIM, eps=1e-3),
+            GatedResidual(DIM),
+            nn.LayerNorm(DIM, eps=1e-3),
+            GatedResidual(DIM),
+        )
+        self.corr = nn.Sequential(
+            nn.Linear(2*49*p*p, DIM),
+            nn.ReLU(inplace=True),
+            nn.Linear(DIM, DIM),
+            nn.LayerNorm(DIM, eps=1e-3),
+            nn.ReLU(inplace=True),
+            nn.Linear(DIM, DIM),
+        )
+        self.d = nn.Sequential(nn.ReLU(inplace=False), nn.Linear(DIM, 2), GradientClip())
+        self.w = nn.Sequential(nn.ReLU(inplace=False), nn.Linear(DIM, 2), GradientClip(), nn.Sigmoid())
+
+    def forward(self, net, inp, corr, flow, ii, jj, kk, export_onnx=False):
+        """ONNX-compatible update operator"""
+        net = net + inp + self.corr(corr)
+        net = self.norm(net)
+
+        # compute neighbors fully tensorized
+        ix, jx = neighbors_tensor(kk, jj)
+
+        mask_ix = (ix >= 0).float().reshape(1, -1, 1)
+        mask_jx = (jx >= 0).float().reshape(1, -1, 1)
+
+        # neighbor updates
+        net = net + self.c1(mask_ix * net[:, ix])
+        net = net + self.c2(mask_jx * net[:, jx])
+
+        # soft aggregation
+        net = net + self.agg_kk(net, kk)
+        net = net + self.agg_ij(net, ii*12345 + jj)
+
+        net = self.gru(net)
+
+        # outputs
+        d_out = self.d(net)
+        w_out = self.w(net)
+
+        if export_onnx:
+            # flatten None output for ONNX
+            return net, d_out, w_out
+        else:
+            return net, (d_out, w_out, None)
+
+#-------------------------------------------------------------------------------------------------------------------
+def neighbors(ii: torch.Tensor, jj: torch.Tensor):
+    """
+    Python version of the original C++ fastba.neighbors()
+
+    Args:
+        ii: LongTensor [N], group/landmark indices
+        jj: LongTensor [N], sort key (e.g., time/frame index)
+
+    Returns:
+        ix, jx: LongTensor [N]
+            ix[n] = index of previous neighbor in same group, -1 if none
+            jx[n] = index of next neighbor in same group, -1 if none
+    """
+    """
+    Example Usage:
+    ii = torch.tensor([0,0,1,1,0,2,2,2,1,0])
+    jj = torch.tensor([5,1,2,3,4,1,2,0,5,0])
+
+    ix, jx = neighbors(ii, jj)
+    print("ix:", ix)
+    print("jx:", jx)
+    """
+    device = ii.device
+    N = ii.shape[0]
+
+    # 1️⃣ Compute unique groups and permutation to map back
+    uniq, perm = torch.unique(ii, return_inverse=True)
+    # uniq: [num_groups], perm[n] = group index
+    num_groups = uniq.shape[0]
+
+    # 2️⃣ Build list of indices per group
+    index = [[] for _ in range(num_groups)]
+    perm_cpu = perm.cpu()
+    for n in range(N):
+        index[perm_cpu[n].item()].append(n)
+
+    # 3️⃣ Allocate ix/jx
+    ix = torch.empty(N, dtype=torch.long, device=device)
+    jx = torch.empty(N, dtype=torch.long, device=device)
+
+    # 4️⃣ Process each group
+    jj_cpu = jj.cpu()
+    for group_idx in range(num_groups):
+        idx_list = index[group_idx]
+        # Sort by jj values
+        sorted_idx = sorted(idx_list, key=lambda i: jj_cpu[i].item())
+        # Fill ix/jx
+        for k, i in enumerate(sorted_idx):
+            ix[i] = sorted_idx[k-1] if k > 0 else -1
+            jx[i] = sorted_idx[k+1] if k < len(sorted_idx)-1 else -1
+
+    # 5️⃣ Move back to original device (GPU/CPU)
+    ix = ix.to(device)
+    jx = jx.to(device)
+
+    return ix, jx
+
+
+class UpdateONNX_v1(nn.Module):
+    export_onnx = True
+    def __init__(self, p):
+        super(UpdateONNX_v1, self).__init__()
+
+        # Linear blocks
+        self.c1 = nn.Sequential(
+            nn.Linear(DIM, DIM),
+            nn.ReLU(inplace=True),
+            nn.Linear(DIM, DIM)
+        )
+
+        self.c2 = nn.Sequential(
+            nn.Linear(DIM, DIM),
+            nn.ReLU(inplace=True),
+            nn.Linear(DIM, DIM)
+        )
+
+        self.norm = nn.LayerNorm(DIM, eps=1e-3)
+
+        # Use your ONNX-compatible SoftAgg
+        self.agg_kk = SoftAggONNX(DIM)
+        self.agg_ij = SoftAggONNX(DIM)
+
+        self.gru = nn.Sequential(
+            nn.LayerNorm(DIM, eps=1e-3),
+            GatedResidual(DIM),
+            nn.LayerNorm(DIM, eps=1e-3),
+            GatedResidual(DIM),
+        )
+
+        self.corr = nn.Sequential(
+            nn.Linear(2*49*p*p, DIM),
+            nn.ReLU(inplace=True),
+            nn.Linear(DIM, DIM),
+            nn.LayerNorm(DIM, eps=1e-3),
+            nn.ReLU(inplace=True),
+            nn.Linear(DIM, DIM),
+        )
+
+        self.d = nn.Sequential(
+            nn.ReLU(inplace=False),
+            nn.Linear(DIM, 2),
+            GradientClip()
+        )
+
+        self.w = nn.Sequential(
+            nn.ReLU(inplace=False),
+            nn.Linear(DIM, 2),
+            GradientClip(),
+            nn.Sigmoid()
+        )
+
+    def forward(self, net, inp, corr, flow, ii, jj, ix, jx, export_onnx=False):
+        """
+        net   : [B, N, D]
+        inp   : [B, N, D]
+        corr  : [B, N, 2*49*p*p]
+        ii, jj: [N]  (used for SoftAggONNX)
+        ix, jx: [N]  precomputed neighbor indices, -1 means no neighbor
+        """
+
+        # --- Residual Fusion ---
+        net = net + inp + self.corr(corr)
+
+        # --- Layer Norm ---
+        net = self.norm(net)
+
+        # --- Gather neighbors safely for ONNX ---
+        B, N, D = net.shape
+
+        # For previous neighbors
+        ix_safe = ix.clamp(min=0)  # replace -1 with 0
+        net_ix = net[:, ix_safe, :]  # gather
+        mask_ix = (ix >= 0).float().view(1, -1, 1)  # [1, N, 1]
+        net = net + self.c1(mask_ix * net_ix)
+
+        # For next neighbors
+        jx_safe = jx.clamp(min=0)
+        net_jx = net[:, jx_safe, :]
+        mask_jx = (jx >= 0).float().view(1, -1, 1)
+        net = net + self.c2(mask_jx * net_jx)
+
+        # --- Soft Aggregation ---
+        net = net + self.agg_kk(net, ii)
+        net = net + self.agg_ij(net, ii*12345 + jj)
+
+        # --- GRU blocks ---
+        net = self.gru(net)
+
+        # --- Outputs ---
+        if export_onnx:
+            return net, self.d(net), self.w(net)
+        else:
+            return net, (self.d(net), self.w(net), None)
+       
+
+# ----------------------------------------
+# 2️⃣ ONNX-compatible SoftAgg 2025-12-16
+# ---------------------------------------
+class SoftAggONNX(nn.Module):
+    def __init__(self, dim=384, expand=True):
+        super().__init__()
+        self.expand = expand
+        self.f = nn.Linear(dim, dim)
+        self.g = nn.Linear(dim, dim)
+        self.h = nn.Linear(dim, dim)
+
+    def forward(self, x, ii):
+        """
+        x : [B, N, D]
+        ii: [N] (group index, same for all batches)
+        Label meaning : 
+            Letter	Meaning
+            b	    batch
+            n	    point index
+            m	    group (segment)
+            d	    feature dim
+        """
+
+        B, N, D = x.shape
+        # Remove int(..), This way, M is a tensor and ONNX will handle it dynamically.
+        M = ii.max() + 1
+
+        # one-hot group mask
+        mask = F.one_hot(ii, M).float()          # [N, M]
+        mask = mask.unsqueeze(0)                 # [1, N, M]
+
+        # attention logits
+        logits = self.g(x)                       # [B, N, D]
+        exp_logits = torch.exp(logits)
+
+        # sum exp per group (batch-wise)
+        # Multiply mask[b, n, m] * exp_logits[b, n, d]
+        # Sum over n (because n is missing in output)
+        '''
+        multiply → sum over named dimensions
+        sum_exp[b, m, d] = sum over n in group m of exp_logits[b, n, d]
+        denom[b, n, d] = sum_exp[b, ii[n], d]
+        '''
+        sum_exp = torch.einsum("bnm,bnd->bmd", mask, exp_logits)
+
+        # normalize
+        # Multiply mask[b,n,m] * sum_exp[b,m,d]
+        # Sum over m
+        # Result shape [B, N, D]
+        w = exp_logits / (torch.einsum("bnm,bmd->bnd", mask, sum_exp) + 1e-6)
+
+        # weighted sum
+        y = torch.einsum("bnm,bnd->bmd", mask, self.f(x) * w)
+
+        y = self.h(y)
+
+        if self.expand:
+            return y[:, ii]
+
+        return y
