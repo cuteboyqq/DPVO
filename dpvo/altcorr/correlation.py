@@ -7,7 +7,9 @@ patchify_python_backward,
 corr_torch_forward,
 corr_backward_kernel, 
 corr_cuda_backward,
-corr_torch_forward_fp16
+corr_torch_forward_fp16,
+corr_forward_torch_wrapper,
+corr_triton_forward_safe
 )
 
 
@@ -30,8 +32,10 @@ class CorrLayer(torch.autograd.Function):
         # print(f"dropout: {dropout}")
         # print("===============================")
         # corr, = cuda_corr.forward(fmap1, fmap2, coords, ii, jj, radius)
-        with autocast(enabled=True, dtype=torch.half):
-            corr, = corr_torch_forward_fp16(fmap1, fmap2, coords, ii, jj, radius)
+        # with autocast(enabled=True, dtype=torch.half):
+        corr, = corr_torch_forward_fp16(fmap1, fmap2, coords, ii, jj, radius)
+        # corr, = corr_triton_forward_safe(fmap1, fmap2, coords, ii, jj, radius)
+        # corr, = corr_forward_torch_wrapper(fmap1, fmap2, coords, ii, jj, radius)
 
         return corr
 
