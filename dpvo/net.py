@@ -89,7 +89,9 @@ class Update(nn.Module):
 
         # Soft Aggregation:   
         net = net + self.agg_kk(net, kk)
-        net = net + self.agg_ij(net, ii*12345 + jj)
+        # net = net + self.agg_ij(net, ii*12345 + jj)
+        agg_ix = torch.clamp(ii*12345 + jj, 0, net.shape[1]-1)
+        net = net + self.agg_ij(net, agg_ix)
 
         net = self.gru(net)
 
@@ -281,32 +283,107 @@ class VONet(nn.Module):
 
 def neighbors_tensor(ii: torch.Tensor, jj: torch.Tensor):
     """
-    Fully tensorized neighbors computation (ONNX-compatible, int64 safe)
+    Fully tensorized neighbors computation WITHOUT torch.unique (ONNX-compatible)
+    ii, jj: [N]  (group indices)
+    Returns:
+        ix, jx: previous and next neighbor indices, shape [N], always in [0, N-1]
     """
+    ii = ii.reshape(-1)
+    jj = jj.reshape(-1)
     N = ii.shape[0]
 
-    # unique segments and inverse mapping
-    uniq, inv = torch.unique(ii, sorted=True, return_inverse=True)  # uniq: [M], inv: [N]
-
-    # mask for same segment
-    segment_mask = inv.unsqueeze(0) == inv.unsqueeze(1)  # [N, N]
-
-    # broadcast jj for comparisons
+    # Broadcast ii and jj to compare all pairs
+    ii_row = ii.unsqueeze(0).expand(N, N)
+    ii_col = ii.unsqueeze(1).expand(N, N)
     jj_row = jj.unsqueeze(0).expand(N, N)
     jj_col = jj.unsqueeze(1).expand(N, N)
 
-    LARGE = 1_000_000  # placeholder for "no neighbor"
+    # Mask to only allow neighbors in the same group
+    mask = ii_row == ii_col  # [N, N]
+
+    # Previous neighbor: jj_row < jj_col
+    prev_mask = mask & (jj_row < jj_col)
+    prev_jj = torch.where(prev_mask, jj_row, torch.full_like(jj_row, 0))
+    ix = torch.argmax(prev_jj, dim=1)
+    ix = torch.clamp(ix, min=0, max=N-1)  # ✅ clamp for CV28
+    
+
+    # Next neighbor: jj_row > jj_col
+    next_mask = mask & (jj_row > jj_col)
+    next_jj = torch.where(next_mask, jj_row, torch.full_like(jj_row, N))
+    jx = torch.argmin(next_jj, dim=1)
+    jx = torch.clamp(jx, min=0, max=N-1)  # ✅ clamp for CV28
+
+    return ix.to(torch.int64), jx.to(torch.int64)
+
+
+
+def neighbors_tensor_v2(ii: torch.Tensor, jj: torch.Tensor):
+    """
+    Fully tensorized neighbors computation WITHOUT torch.unique (ONNX-compatible)
+    ii, jj: any shape -> flattened to [N]
+    Returns:
+        ix, jx: previous and next neighbor indices, shape [N]
+    """
+    ii = ii.reshape(-1)
+    jj = jj.reshape(-1)
+    N = ii.shape[0]
+
+    LARGE = 1_000_000
+    SMALL = -1_000_000
+
+    # Broadcast ii and jj to compare all pairs
+    ii_row = ii.unsqueeze(0).expand(N, N)
+    ii_col = ii.unsqueeze(1).expand(N, N)
+    jj_row = jj.unsqueeze(0).expand(N, N)
+    jj_col = jj.unsqueeze(1).expand(N, N)
+
+    # Mask to only allow neighbors in the same group
+    mask = ii_row == ii_col  # [N, N]
+
+    # Previous neighbor: jj_row < jj_col
+    prev_mask = mask & (jj_row < jj_col)
+    prev_jj = torch.where(prev_mask, jj_row, torch.full_like(jj_row, SMALL))
+    ix = torch.argmax(prev_jj, dim=1)
+    ix = torch.where(prev_mask.any(dim=1), ix, torch.full_like(ix, -1))
+
+    # Next neighbor: jj_row > jj_col
+    next_mask = mask & (jj_row > jj_col)
+    next_jj = torch.where(next_mask, jj_row, torch.full_like(jj_row, LARGE))
+    jx = torch.argmin(next_jj, dim=1)
+    jx = torch.where(next_mask.any(dim=1), jx, torch.full_like(jx, -1))
+
+    return ix.to(torch.int64), jx.to(torch.int64)
+
+
+def neighbors_tensor_v1(ii: torch.Tensor, jj: torch.Tensor):
+    """
+    Fully tensorized neighbors computation (ONNX-compatible)
+    ii, jj: any shape -> flattened to [N]
+    """
+
+    # ✅ CRITICAL FIX: flatten indices
+    ii = ii.reshape(-1)
+    jj = jj.reshape(-1)
+
+    N = ii.shape[0]
+
+    uniq, inv = torch.unique(ii, sorted=True, return_inverse=True)
+    segment_mask = inv.unsqueeze(0) == inv.unsqueeze(1)  # [N, N]
+
+    jj_row = jj.unsqueeze(0).expand(N, N)
+    jj_col = jj.unsqueeze(1).expand(N, N)
+
+    LARGE = 1_000_000
     SMALL = -1_000_000
 
     jj_row = torch.where(segment_mask, jj_row, torch.full_like(jj_row, LARGE))
 
-    # previous neighbor
     prev_mask = jj_row < jj.unsqueeze(1)
     prev_jj = torch.where(prev_mask, jj_row, torch.full_like(jj_row, SMALL))
     ix = torch.argmax(prev_jj, dim=1)
     ix = torch.where(prev_mask.any(dim=1), ix, torch.full_like(ix, -1))
 
-    # next neighbor
     next_mask = jj_row > jj.unsqueeze(1)
     next_jj = torch.where(next_mask, jj_row, torch.full_like(jj_row, LARGE))
     jx = torch.argmin(next_jj, dim=1)
@@ -314,14 +391,16 @@ def neighbors_tensor(ii: torch.Tensor, jj: torch.Tensor):
 
     return ix.to(torch.int64), jx.to(torch.int64)
 
+
 class UpdateONNX(nn.Module):
-    def __init__(self, p):
+    def __init__(self, p,export_onnx=False):
         super(UpdateONNX, self).__init__()
         self.c1 = nn.Sequential(nn.Linear(DIM, DIM), nn.ReLU(inplace=True), nn.Linear(DIM, DIM))
         self.c2 = nn.Sequential(nn.Linear(DIM, DIM), nn.ReLU(inplace=True), nn.Linear(DIM, DIM))
         self.norm = nn.LayerNorm(DIM, eps=1e-3)
         self.agg_kk = SoftAggONNX(DIM)
         self.agg_ij = SoftAggONNX(DIM)
+        self.export_onnx = export_onnx
         self.gru = nn.Sequential(
             nn.LayerNorm(DIM, eps=1e-3),
             GatedResidual(DIM),
@@ -339,8 +418,78 @@ class UpdateONNX(nn.Module):
         self.d = nn.Sequential(nn.ReLU(inplace=False), nn.Linear(DIM, 2), GradientClip())
         self.w = nn.Sequential(nn.ReLU(inplace=False), nn.Linear(DIM, 2), GradientClip(), nn.Sigmoid())
 
-    def forward(self, net, inp, corr, flow, ii, jj, kk, export_onnx=False):
-        """ONNX-compatible update operator"""
+    def forward(self, net, inp, corr, ii, jj, kk):
+        # CV28 input reshape (4D -> 3D)
+        net  = net.squeeze(-1).permute(0, 2, 1)
+        inp  = inp.squeeze(-1).permute(0, 2, 1)
+        corr = corr.squeeze(-1).permute(0, 2, 1)
+
+        ii = ii.squeeze(0).squeeze(-1)
+        jj = jj.squeeze(0).squeeze(-1)
+        kk = kk.squeeze(0).squeeze(-1)
+
+        net = net + inp + self.corr(corr)
+        net = self.norm(net)
+
+        # compute neighbors
+        ix, jx = neighbors_tensor(kk, jj)
+
+        mask_ix = torch.ones_like(ix, dtype=net.dtype).view(1, -1, 1)  # use full mask
+        mask_jx = torch.ones_like(jx, dtype=net.dtype).view(1, -1, 1)
+
+        # clamp indices to [0, H-1] for CV28
+        ix = torch.clamp(ix, 0, net.shape[1]-1)
+        jx = torch.clamp(jx, 0, net.shape[1]-1)
+
+        # neighbor updates
+        net = net + self.c1(net[:, ix])
+        net = net + self.c2(net[:, jx])
+
+        # soft aggregation
+        net = net + self.agg_kk(net, kk)
+        net = net + self.agg_ij(net, ii*12345 + jj)
+
+        net = self.gru(net)
+
+        # outputs
+        d_out = self.d(net)
+        w_out = self.w(net)
+
+        if self.export_onnx:
+            net_out = net.permute(0, 2, 1).unsqueeze(-1)
+            d_out = d_out.permute(0, 2, 1).unsqueeze(-1)
+            w_out = w_out.permute(0, 2, 1).unsqueeze(-1)
+            return net_out, d_out, w_out
+
+        return net, (d_out, w_out, None)
+
+    
+    def forward_v1(self, net, inp, corr, ii, jj, kk):
+        """
+        net  : [B, C, H, 1]   -> CV28 input
+        inp  : [B, C, H, 1]
+        corr : [B, Cc, H, 1]
+        ii,jj,kk: [1, H]
+        """
+        """
+        Current:
+        ii,jj,kk: [1, H]
+        New:
+        ii,jj,kk: [1, H, 1]
+        """
+        # ---------------------------
+        # CV28 input reshape (4D -> 3D)
+        # ---------------------------
+        # net:  [B, C, H, 1] -> [B, H, C]
+        net  = net.squeeze(-1).permute(0, 2, 1)
+        inp  = inp.squeeze(-1).permute(0, 2, 1)
+        corr = corr.squeeze(-1).permute(0, 2, 1)
+
+        # indices: [1, H] -> [H]
+        ii = ii.squeeze(0).squeeze(-1)  # [H]
+        jj = jj.squeeze(0).squeeze(-1)  # [H]
+        kk = kk.squeeze(0).squeeze(-1)  # [H]
+
         net = net + inp + self.corr(corr)
         net = self.norm(net)
 
@@ -364,11 +513,18 @@ class UpdateONNX(nn.Module):
         d_out = self.d(net)
         w_out = self.w(net)
 
-        if export_onnx:
-            # flatten None output for ONNX
-            return net, d_out, w_out
-        else:
-            return net, (d_out, w_out, None)
+        if self.export_onnx:
+            # net: [B, H, DIM]
+            net_out = net.permute(0, 2, 1).unsqueeze(-1)   # [B, DIM, H, 1]
+            # d_out: [B, H, 2] → [B, 2, H, 1]
+            d_out = d_out.permute(0, 2, 1).unsqueeze(-1)
+            # w_out: [B, H, 2] → [B, 2, H, 1]
+            w_out = w_out.permute(0, 2, 1).unsqueeze(-1)
+
+            return net_out, d_out, w_out
+
+
+        return net, (d_out, w_out, None)
 
 #-------------------------------------------------------------------------------------------------------------------
 def neighbors(ii: torch.Tensor, jj: torch.Tensor):
@@ -529,7 +685,195 @@ class UpdateONNX_v1(nn.Module):
 # ----------------------------------------
 # 2️⃣ ONNX-compatible SoftAgg 2025-12-16
 # ---------------------------------------
+
 class SoftAggONNX(nn.Module):
+    def __init__(self, dim=512, expand=False):
+        super().__init__()
+        self.f = nn.Linear(dim, dim)
+        self.g = nn.Linear(dim, dim)
+        self.h = nn.Linear(dim, dim)
+        self.expand = expand
+
+    def forward(self, x, ix):
+        """
+        x  : [B, N, C]
+        ix : [N]   int32 (group index)
+        """
+        B, N, C = x.shape
+        device = x.device
+        dtype = x.dtype
+
+        # --------------------------
+        # 1️⃣ Ensure int64 indices and clamp
+        # --------------------------
+        jx = ix.to(torch.int64)
+        jx = torch.clamp(jx, min=0, max=N-1)
+
+        # --------------------------
+        # 2️⃣ Compute logits
+        # --------------------------
+        logits = self.g(x)
+        exp_logits = torch.exp(logits)
+
+        # --------------------------
+        # 3️⃣ Preallocate denominator with static shape [B, N, C]
+        # --------------------------
+        denom = torch.zeros((B, N, C), device=device, dtype=dtype)
+        jx_expand = jx.view(1, N, 1).expand(B, N, C)
+        jx_expand = torch.clamp(jx_expand, 0, N-1)
+        denom.scatter_add_(1, jx_expand, exp_logits)
+
+        # safe division
+        w = exp_logits / torch.clamp(denom, min=1e-6)
+
+        # --------------------------
+        # 4️⃣ Weighted scatter sum
+        # --------------------------
+        fx = self.f(x)
+        weighted = fx * w
+        y = torch.zeros((B, N, C), device=device, dtype=dtype)
+        y.scatter_add_(1, jx_expand, weighted)
+
+        # --------------------------
+        # 5️⃣ Output
+        # --------------------------
+        y = self.h(y)
+
+        if self.expand:
+            # gather back to original positions
+            y = torch.gather(y, 1, jx_expand)
+
+        return y
+
+
+
+class SoftAggONNX_v3(nn.Module):
+    def __init__(self, dim=512, expand=True):
+        super().__init__()
+        self.f = nn.Linear(dim, dim)
+        self.g = nn.Linear(dim, dim)
+        self.h = nn.Linear(dim, dim)
+        self.expand = expand
+
+    def forward(self, x, ix):
+        """
+        x  : [B, N, C]
+        ix : [N]   int32 (group index)
+        """
+        B, N, C = x.shape
+        device = x.device
+        dtype = x.dtype
+
+        # --------------------------
+        # 1️⃣ Ensure int64 indices
+        # --------------------------
+        jx = ix.to(torch.int64)
+        jx = torch.clamp(jx, min=0, max=N-1)  # ✅ clamp for CV28
+
+        # --------------------------
+        # 2️⃣ Compute logits
+        # --------------------------
+        logits = self.g(x)
+        exp_logits = torch.exp(logits)
+
+        # --------------------------
+        # 3️⃣ Preallocate denominator with static shape [B, N, C]
+        # --------------------------
+        denom = torch.zeros((B, N, C), device=device, dtype=dtype)
+
+        # scatter_add to denominator
+        jx_expand = jx.view(1, N, 1).expand(B, N, C)
+        denom.scatter_add_(1, jx_expand, exp_logits)
+
+        # safe division
+        w = exp_logits / torch.clamp(denom, min=1e-6)
+
+        # --------------------------
+        # 4️⃣ Weighted scatter sum
+        # --------------------------
+        fx = self.f(x)
+        weighted = fx * w
+
+        y = torch.zeros((B, N, C), device=device, dtype=dtype)
+        y.scatter_add_(1, jx_expand, weighted)
+
+        # --------------------------
+        # 5️⃣ Output
+        # --------------------------
+        y = self.h(y)
+
+        if self.expand:
+            # gather back to original positions
+            y = torch.gather(y, 1, jx_expand)
+
+        return y
+
+
+
+class SoftAggONNX_v2(nn.Module):
+    def __init__(self, dim=512, expand=True):
+        super().__init__()
+        self.f = nn.Linear(dim, dim)
+        self.g = nn.Linear(dim, dim)
+        self.h = nn.Linear(dim, dim)
+        self.expand = expand
+
+    def forward(self, x, ix):
+        """
+        x : [B, N, C]
+        ix: [N]   (group index, int32 from CV28-friendly input)
+        """
+        B, N, C = x.shape
+        device = x.device
+        dtype = x.dtype
+
+        # --------------------------------------------------
+        # 1️⃣ FORCE int64 index (PyTorch / ONNX requirement)
+        # --------------------------------------------------
+        jx = ix.to(torch.int64)   # ✅ REQUIRED
+
+        M = jx.max() + 1          # tensor scalar (int64)
+
+        # --------------------------------------------------
+        # 2️⃣ Compute logits
+        # --------------------------------------------------
+        logits = self.g(x)
+        exp_logits = torch.exp(logits)
+
+        # --------------------------------------------------
+        # 3️⃣ Group-wise softmax
+        # --------------------------------------------------
+        denom = torch.zeros((B, M, C), device=device, dtype=dtype)
+
+        jx_expand = jx.view(1, N, 1).expand(B, N, C)
+
+        denom.scatter_add_(1, jx_expand, exp_logits)
+
+        w = exp_logits / torch.gather(denom, 1, jx_expand)
+
+        # --------------------------------------------------
+        # 4️⃣ Weighted scatter sum
+        # --------------------------------------------------
+        fx = self.f(x)
+        weighted = fx * w
+
+        y = torch.zeros((B, M, C), device=device, dtype=dtype)
+        y.scatter_add_(1, jx_expand, weighted)
+
+        # --------------------------------------------------
+        # 5️⃣ Output
+        # --------------------------------------------------
+        y = self.h(y)
+
+        if self.expand:
+            return torch.gather(y, 1, jx_expand)
+
+        return y
+
+
+
+
+class SoftAggONNX_v1(nn.Module):
     def __init__(self, dim=384, expand=True):
         super().__init__()
         self.expand = expand
