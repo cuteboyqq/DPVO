@@ -83,50 +83,90 @@ def block_show(A):
     plt.imshow(A[0].detach().cpu().numpy())
     plt.show()
 
-def BA(poses, patches, intrinsics, targets, weights, lmbda, ii, jj, kk, bounds, ep=100.0, PRINT=False, fixedp=1, structure_only=False):
-    """ bundle adjustment """
+def BA(poses, patches, intrinsics, targets, weights, lmbda,
+       ii, jj, kk, bounds, ep=100.0, PRINT=False,
+       fixedp=1, structure_only=False):
+    """
+    Bundle Adjustment for DPVO
 
-    b = 1
-    n = max(ii.max().item(), jj.max().item()) + 1
+    Solves:
+        [ B  E ] [ dX ] = [ v ]
+        [ Eᵀ C ] [ dZ ]   [ w ]
 
+    using the Schur complement to eliminate structure (Z).
+    """
+
+    # ---------------------------------------------------------
+    # Basic setup
+    # ---------------------------------------------------------
+    b = 1  # DPVO uses batch size = 1
+    n = max(ii.max().item(), jj.max().item()) + 1  # number of pose variables
+
+    # ---------------------------------------------------------
+    # Forward projection + Jacobians
+    # ---------------------------------------------------------
+    # coords : projected patch coordinates
+    # v      : validity mask
+    # Ji,Jj  : Jacobians wrt pose i and j (6 DoF)
+    # Jz     : Jacobian wrt inverse depth
     coords, v, (Ji, Jj, Jz) = \
         pops.transform(poses, patches, intrinsics, ii, jj, kk, jacobian=True)
 
-    p = coords.shape[3]
-    r = targets - coords[...,p//2,p//2,:]
+    # ---------------------------------------------------------
+    # Compute residual at patch center
+    # ---------------------------------------------------------
+    p = coords.shape[3]                      # patch size
+    r = targets - coords[..., p//2, p//2, :] # reprojection residual
 
+    # Reject large residuals
     v *= (r.norm(dim=-1) < 250).float()
 
+    # Reject projections outside image bounds
     in_bounds = \
-        (coords[...,p//2,p//2,0] > bounds[0]) & \
-        (coords[...,p//2,p//2,1] > bounds[1]) & \
-        (coords[...,p//2,p//2,0] < bounds[2]) & \
-        (coords[...,p//2,p//2,1] < bounds[3])
+        (coords[..., p//2, p//2, 0] > bounds[0]) & \
+        (coords[..., p//2, p//2, 1] > bounds[1]) & \
+        (coords[..., p//2, p//2, 0] < bounds[2]) & \
+        (coords[..., p//2, p//2, 1] < bounds[3])
 
     v *= in_bounds.float()
 
     if PRINT:
-        print((r * v[...,None]).norm(dim=-1).mean().item())
+        print((r * v[..., None]).norm(dim=-1).mean().item())
 
-    r = (v[...,None] * r).unsqueeze(dim=-1)    
-    weights = (v[...,None] * weights).unsqueeze(dim=-1)
+    # Apply validity mask
+    r = (v[..., None] * r).unsqueeze(dim=-1)
+    weights = (v[..., None] * weights).unsqueeze(dim=-1)
 
-    wJiT = (weights * Ji).transpose(2,3)
-    wJjT = (weights * Jj).transpose(2,3)
-    wJzT = (weights * Jz).transpose(2,3)
+    # ---------------------------------------------------------
+    # Build weighted Jacobians
+    # ---------------------------------------------------------
+    wJiT = (weights * Ji).transpose(2, 3)
+    wJjT = (weights * Jj).transpose(2, 3)
+    wJzT = (weights * Jz).transpose(2, 3)
 
+    # ---------------------------------------------------------
+    # Pose–pose Hessian blocks
+    # ---------------------------------------------------------
     Bii = torch.matmul(wJiT, Ji)
     Bij = torch.matmul(wJiT, Jj)
     Bji = torch.matmul(wJjT, Ji)
     Bjj = torch.matmul(wJjT, Jj)
 
+    # ---------------------------------------------------------
+    # Pose–structure Hessian blocks
+    # ---------------------------------------------------------
     Eik = torch.matmul(wJiT, Jz)
     Ejk = torch.matmul(wJjT, Jz)
 
+    # ---------------------------------------------------------
+    # Gradient vectors
+    # ---------------------------------------------------------
     vi = torch.matmul(wJiT, r)
     vj = torch.matmul(wJjT, r)
 
-    # fix first pose
+    # ---------------------------------------------------------
+    # Fix first pose (gauge freedom)
+    # ---------------------------------------------------------
     ii = ii.clone()
     jj = jj.clone()
 
@@ -134,44 +174,79 @@ def BA(poses, patches, intrinsics, targets, weights, lmbda, ii, jj, kk, bounds, 
     ii = ii - fixedp
     jj = jj - fixedp
 
+    # ---------------------------------------------------------
+    # Reindex structure variables
+    # ---------------------------------------------------------
     kx, kk = torch.unique(kk, return_inverse=True, sorted=True)
-    m = len(kx)
+    m = len(kx)  # number of structure variables
 
+    # ---------------------------------------------------------
+    # Assemble global pose Hessian B (block sparse)
+    # ---------------------------------------------------------
     B = safe_scatter_add_mat(Bii, ii, ii, n, n).view(b, n, n, 6, 6) + \
         safe_scatter_add_mat(Bij, ii, jj, n, n).view(b, n, n, 6, 6) + \
         safe_scatter_add_mat(Bji, jj, ii, n, n).view(b, n, n, 6, 6) + \
         safe_scatter_add_mat(Bjj, jj, jj, n, n).view(b, n, n, 6, 6)
 
+    # ---------------------------------------------------------
+    # Assemble pose–structure coupling matrix E
+    # ---------------------------------------------------------
     E = safe_scatter_add_mat(Eik, ii, kk, n, m).view(b, n, m, 6, 1) + \
-        safe_scatter_add_mat(Ejk, jj, kk, n, m).view(b, n, m, 6, 1) 
+        safe_scatter_add_mat(Ejk, jj, kk, n, m).view(b, n, m, 6, 1)
 
+    # ---------------------------------------------------------
+    # Structure Hessian (diagonal)
+    # ---------------------------------------------------------
     C = safe_scatter_add_vec(torch.matmul(wJzT, Jz), kk, m)
 
+    # ---------------------------------------------------------
+    # Assemble gradient vectors
+    # ---------------------------------------------------------
     v = safe_scatter_add_vec(vi, ii, n).view(b, n, 1, 6, 1) + \
         safe_scatter_add_vec(vj, jj, n).view(b, n, 1, 6, 1)
 
-    w = safe_scatter_add_vec(torch.matmul(wJzT,  r), kk, m)
+    w = safe_scatter_add_vec(torch.matmul(wJzT, r), kk, m)
 
+    # ---------------------------------------------------------
+    # Levenberg–Marquardt damping
+    # ---------------------------------------------------------
     if isinstance(lmbda, torch.Tensor):
         lmbda = lmbda.reshape(*C.shape)
-        
+
+    # Inverse of (C + λI) — diagonal, cheap
     Q = 1.0 / (C + lmbda)
-    
-    ### solve w/ schur complement ###
-    EQ = E * Q[:,None]
+
+    # ---------------------------------------------------------
+    # Schur complement solve
+    # ---------------------------------------------------------
+    EQ = E * Q[:, None]  # E * C⁻¹
 
     if structure_only or n == 0:
+        # Only update structure
         dZ = (Q * w).view(b, -1, 1, 1)
 
     else:
-        S = B - block_matmul(EQ, E.permute(0,2,1,4,3))
+        # Pose-only system:
+        # S = B − E C⁻¹ Eᵀ
+        S = B - block_matmul(EQ, E.permute(0, 2, 1, 4, 3))
+
+        # y = v − E C⁻¹ w
         y = v - block_matmul(EQ, w.unsqueeze(dim=2))
+
+        # Solve for pose increments
         dX = block_solve(S, y, ep=ep, lm=1e-4)
 
-        dZ = Q * (w - block_matmul(E.permute(0,2,1,4,3), dX).squeeze(dim=-1))
+        # Back-substitute structure increments
+        dZ = Q * (
+            w - block_matmul(E.permute(0, 2, 1, 4, 3), dX).squeeze(dim=-1)
+        )
+
         dX = dX.view(b, -1, 6)
         dZ = dZ.view(b, -1, 1, 1)
 
+    # ---------------------------------------------------------
+    # Apply updates
+    # ---------------------------------------------------------
     x, y, disps = patches.unbind(dim=2)
     disps = disp_retr(disps, dZ, kx).clamp(min=1e-3, max=10.0)
     patches = torch.stack([x, y, disps], dim=2)
