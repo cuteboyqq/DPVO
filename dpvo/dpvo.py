@@ -9,7 +9,6 @@ from .lietorch import SE3
 from .net import VONet
 from .patchgraph import PatchGraph
 from .utils import *
-from .fastba.ba_cuda_py import cuda_ba
 from .ba import python_ba_wrapper
 
 mp.set_start_method('spawn', True)
@@ -20,45 +19,7 @@ Id = SE3.Identity(1, device="cuda")
 
 
 class DPVO:
-    """
-    Dense Patch Visual Odometry (DPVO) system class.
 
-    Args:
-        cfg (Namespace): Configuration object containing system parameters, e.g.,
-            - PATCHES_PER_FRAME (int)
-            - BUFFER_SIZE (int)
-            - MIXED_PRECISION (bool)
-            - LOOP_CLOSURE (bool)
-            - CLASSIC_LOOP_CLOSURE (bool)
-            - MAX_EDGE_AGE (int)
-        network (str or Path): Path to pre-trained network weights.
-        ht (int, optional): Input image height. Default is 480.
-        wd (int, optional): Input image width. Default is 640.
-        viz (bool, optional): Enable visualization viewer. Default is False.
-
-    Attributes:
-        is_initialized (bool): Flag indicating if DPVO has been initialized.
-        enable_timing (bool): Flag to enable timing measurement.
-        M (int): Number of patches per frame.
-        N (int): Buffer size (maximum number of frames).
-        ht, wd (int): Image height and width.
-        DIM (int): Feature dimension for patch descriptors (from cfg).
-        RES (int): Resolution factor for downsampling.
-        tlist (list): List storing timestamps or other temporal info.
-        counter (int): Frame counter.
-        ran_global_ba (np.ndarray): Boolean array tracking global bundle adjustment calls.
-        image_ (torch.Tensor): Dummy image for visualization (ht x wd x 3).
-        kwargs (dict): Device and dtype arguments for tensors.
-        pmem (int): Patch memory size.
-        mem (int): Frame memory size.
-        last_global_ba (int): Index of last global BA call (if loop closure enabled).
-        imap_ (torch.Tensor): Local feature memory for patches (pmem x M x DIM).
-        gmap_ (torch.Tensor): Global feature memory for patches (pmem x M x 128 x P x P).
-        pg (PatchGraph): PatchGraph object storing frames, patches, and edges.
-        fmap1_, fmap2_ (torch.Tensor): Feature pyramid maps at different resolutions.
-        pyramid (tuple): Tuple containing fmap1_ and fmap2_.
-        viewer: Visualization viewer object (if viz enabled).
-    """
     def __init__(self, cfg, network, ht=480, wd=640, viz=False):
         self.cfg = cfg
         self.load_weights(network)
@@ -95,7 +56,7 @@ class DPVO:
             self.kwargs = kwargs = {"device": "cuda", "dtype": torch.float}
 
         ### frame memory size ###
-        self.pmem = self.mem = 36 # 36 # 32 was too small given default settings
+        self.pmem = self.mem = 36 # 32 was too small given default settings
         if self.cfg.LOOP_CLOSURE:
             self.last_global_ba = -1000 # keep track of time since last global opt
             self.pmem = self.cfg.MAX_EDGE_AGE # patch memory
@@ -120,8 +81,7 @@ class DPVO:
             self.start_viewer()
             
         self.show_config()
-    
-    
+            
     def show_config(self):
         """ Pretty config + runtime state printout with emojis """
 
@@ -177,8 +137,6 @@ class DPVO:
 
         print("\n===========================================================\n")
 
-
-    
     def load_long_term_loop_closure(self):
         try:
             from .loop_closure.long_term import LongTermLoopClosure
@@ -310,35 +268,15 @@ class DPVO:
         """ reproject patch k from i -> j """
         (ii, jj, kk) = indicies if indicies is not None else (self.pg.ii, self.pg.jj, self.pg.kk)
         coords = pops.transform(SE3(self.poses), self.patches, self.intrinsics, ii, jj, kk)
-      
         return coords.permute(0, 1, 4, 2, 3).contiguous()
 
     def append_factors(self, ii, jj):
-        # --------------------------------------
-        # FORCE CONSISTENT NUMBER OF FACTORS
-        # --------------------------------------
-        N = min(len(ii), len(jj))
-
-        ii     = ii[:N]
-        jj     = jj[:N]
-        
-        
-        # assert len(ii) == len(jj), "append_factors: ii and jj mismatch"
-
-     
-        # kk     = kk[:N]
-        # weight = weight[:N]
-        # target = target[:N]
         self.pg.jj = torch.cat([self.pg.jj, jj])
         self.pg.kk = torch.cat([self.pg.kk, ii])
         self.pg.ii = torch.cat([self.pg.ii, self.ix[ii]])
 
         net = torch.zeros(1, len(ii), self.DIM, **self.kwargs)
         self.pg.net = torch.cat([self.pg.net, net], dim=1)
-        
-        # 3) net was created inside append_factors; ensure size matches:
-        assert self.pg.jj.size(0) == self.pg.kk.size(0) == self.pg.ii.size(0), \
-        f"pg mismatch: ii {self.pg.ii.size(0)}, jj {self.pg.jj.size(0)}, kk {self.pg.kk.size(0)}"
 
     def remove_factors(self, m, store: bool):
         assert self.pg.ii.numel() == self.pg.weight.shape[1]
@@ -454,7 +392,7 @@ class DPVO:
                 ctx = self.imap[:, self.pg.kk % (self.M * self.pmem)]
                 self.pg.net, (delta, weight, _) = \
                     self.network.update(self.pg.net, ctx, corr, None, self.pg.ii, self.pg.jj, self.pg.kk)
-                    
+
             lmbda = torch.as_tensor([1e-4], device="cuda")
             weight = weight.float()
             target = coords[...,self.P//2,self.P//2] + delta.float()
@@ -471,9 +409,7 @@ class DPVO:
                     t0 = self.n - self.cfg.OPTIMIZATION_WINDOW if self.is_initialized else 1
                     t0 = max(t0, 1)
                     # fastba.BA(self.poses, self.patches, self.intrinsics, 
-                    #    target, weight, lmbda, self.pg.ii, self.pg.jj, self.pg.kk, t0, self.n, M=self.M, iterations=2, eff_impl=False)
-                    # print(type(self.poses))
-                    # print(self.__dict__.keys())
+                    #     target, weight, lmbda, self.pg.ii, self.pg.jj, self.pg.kk, t0, self.n, M=self.M, iterations=2, eff_impl=False)
                     '''Use python torch BA function from ba.py, Alister 2025-12-15 updated'''
                     new_poses = python_ba_wrapper(self.poses, self.patches, self.intrinsics, target, weight,
                                         lmbda, self.pg.ii, self.pg.jj, self.pg.kk, PPF=None, t0=t0, t1=self.n, iterations=2, eff_impl=False)
@@ -485,8 +421,6 @@ class DPVO:
                     self.poses.copy_(new_poses)
             except:
                 print("Warning BA failed...")
-                import traceback
-                traceback.print_exc()
 
             points = pops.point_cloud(SE3(self.poses), self.patches[:, :self.m], self.intrinsics, self.ix[:self.m])
             points = (points[...,1,1,:3] / points[...,1,1,3:]).reshape(-1, 3)
@@ -504,8 +438,7 @@ class DPVO:
         r=self.cfg.PATCH_LIFETIME
         t0 = self.M * max((self.n - 1), 0)
         t1 = self.M * max((self.n - 0), 0)
-        return flatmeshgrid(
-            torch.arange(t0, t1, device="cuda"),
+        return flatmeshgrid(torch.arange(t0, t1, device="cuda"),
             torch.arange(max(self.n-r, 0), self.n, device="cuda"), indexing='ij')
 
     def __call__(self, tstamp, image, intrinsics):
@@ -521,8 +454,7 @@ class DPVO:
             self.viewer.update_image(image.contiguous())
 
         image = 2 * (image[None,None] / 255.0) - 0.5
-        # The normalized image is passed through the network's patchify method,
-        # often using mixed precision (autocast) for faster computation.
+        
         with autocast(enabled=self.cfg.MIXED_PRECISION):
             fmap, gmap, imap, patches, _, clr = \
                 self.network.patchify(image,
@@ -567,9 +499,6 @@ class DPVO:
         self.pg.patches_[self.n] = patches
 
         ### update network attributes ###
-        # Network Attribute Updates
-        # The features extracted by the network are stored in circular buffers
-        # (% self.pmem or % self.mem) for subsequent processing (e.g., tracking).
         self.imap_[self.n % self.pmem] = imap.squeeze()
         self.gmap_[self.n % self.pmem] = gmap.squeeze()
         self.fmap1_[:, self.n % self.mem] = F.avg_pool2d(fmap[0], 1, 1)
@@ -592,21 +521,20 @@ class DPVO:
                     self.last_global_ba = self.n
                     self.append_factors(lii, ljj)
 
-        # Add forward and backward factors, Odometry Factor Addition:
+        # Add forward and backward factors
         self.append_factors(*self.__edges_forw())
         self.append_factors(*self.__edges_back())
-        # Initial Optimization Block:
+
         if self.n == 8 and not self.is_initialized:
             self.is_initialized = True
 
             for itr in range(12):
                 self.update()
-        #Regular Update:
+
         elif self.is_initialized:
             self.update()
             self.keyframe()
 
-        # Classic Loop Closure Post-Processing (Optional):
         if self.cfg.CLASSIC_LOOP_CLOSURE:
             self.long_term_lc.attempt_loop_closure(self.n)
             self.long_term_lc.lc_callback()
