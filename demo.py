@@ -77,7 +77,7 @@ def run(cfg, network, imagedir, calib, stride=1, skip=0, viz=False, timeit=False
     else:
         peak_gpu_mem_gb = 0.0
 
-    print("--- Performance Metrics ---")
+    print("--- DPVO Performance Metrics ---")
     print(f"Total Frames Processed: {frame_count}")
     print(f"Total Processing Time (excluding init): {total_time:.2f} s")
     print(f"Average FPS: {average_fps:.2f}")
