@@ -19,7 +19,45 @@ Id = SE3.Identity(1, device="cuda")
 
 
 class DPVO:
+    """
+    Dense Patch Visual Odometry (DPVO) system class.
 
+    Args:
+        cfg (Namespace): Configuration object containing system parameters, e.g.,
+            - PATCHES_PER_FRAME (int)
+            - BUFFER_SIZE (int)
+            - MIXED_PRECISION (bool)
+            - LOOP_CLOSURE (bool)
+            - CLASSIC_LOOP_CLOSURE (bool)
+            - MAX_EDGE_AGE (int)
+        network (str or Path): Path to pre-trained network weights.
+        ht (int, optional): Input image height. Default is 480.
+        wd (int, optional): Input image width. Default is 640.
+        viz (bool, optional): Enable visualization viewer. Default is False.
+
+    Attributes:
+        is_initialized (bool): Flag indicating if DPVO has been initialized.
+        enable_timing (bool): Flag to enable timing measurement.
+        M (int): Number of patches per frame.
+        N (int): Buffer size (maximum number of frames).
+        ht, wd (int): Image height and width.
+        DIM (int): Feature dimension for patch descriptors (from cfg).
+        RES (int): Resolution factor for downsampling.
+        tlist (list): List storing timestamps or other temporal info.
+        counter (int): Frame counter.
+        ran_global_ba (np.ndarray): Boolean array tracking global bundle adjustment calls.
+        image_ (torch.Tensor): Dummy image for visualization (ht x wd x 3).
+        kwargs (dict): Device and dtype arguments for tensors.
+        pmem (int): Patch memory size.
+        mem (int): Frame memory size.
+        last_global_ba (int): Index of last global BA call (if loop closure enabled).
+        imap_ (torch.Tensor): Local feature memory for patches (pmem x M x DIM).
+        gmap_ (torch.Tensor): Global feature memory for patches (pmem x M x 128 x P x P).
+        pg (PatchGraph): PatchGraph object storing frames, patches, and edges.
+        fmap1_, fmap2_ (torch.Tensor): Feature pyramid maps at different resolutions.
+        pyramid (tuple): Tuple containing fmap1_ and fmap2_.
+        viewer: Visualization viewer object (if viz enabled).
+    """
     def __init__(self, cfg, network, ht=480, wd=640, viz=False):
         self.cfg = cfg
         self.load_weights(network)
@@ -79,7 +117,8 @@ class DPVO:
         self.viewer = None
         if viz:
             self.start_viewer()
-            
+        
+        self._pg_shape_ref = None
         self.show_config()
             
     def show_config(self):
@@ -383,11 +422,33 @@ class DPVO:
             full_target, full_weight, lmbda, full_ii, full_jj, full_kk, t0, self.n, M=self.M, iterations=2, eff_impl=True)
         self.ran_global_ba[self.n] = True
 
+    
+    def _check_pg_static_shape(self):
+        shapes = (
+            tuple(self.pg.ii.shape),
+            tuple(self.pg.jj.shape),
+            tuple(self.pg.kk.shape),
+        )
+
+        if self._pg_shape_ref is None:
+            self._pg_shape_ref = shapes
+            print(f"[PG SHAPE INIT] ii/jj/kk shapes = {shapes}")
+        else:
+            if shapes != self._pg_shape_ref:
+                print(
+                    "[PG SHAPE CHANGE DETECTED]\n"
+                    f"  previous = {self._pg_shape_ref}\n"
+                    f"  current  = {shapes}"
+                )
+                self._pg_shape_ref = shapes
+    
+    
     def update(self):
         with Timer("other", enabled=self.enable_timing):
             coords = self.reproject()
 
             with autocast(enabled=True):
+                self._check_pg_static_shape()
                 corr = self.corr(coords)
                 ctx = self.imap[:, self.pg.kk % (self.M * self.pmem)]
                 self.pg.net, (delta, weight, _) = \
