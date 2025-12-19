@@ -17,6 +17,13 @@ import triton.language as tl
 # --------------------------
 # Triton kernel
 # --------------------------
+import torch
+import triton
+import triton.language as tl
+
+# --------------------------
+# Triton kernel
+# --------------------------
 @triton.jit
 def corr_triton_kernel_safe(
     fmap1_ptr, fmap2_ptr, coords_ptr, ii_ptr, jj_ptr, corr_ptr,
@@ -117,6 +124,7 @@ def corr_triton_forward_safe(fmap1, fmap2, coords, ii, jj, radius, BLOCK_C=32):
 
     # Return corr tensor directly (bilinear interpolation can be done in PyTorch if needed)
     return corr
+
 
 
 '''
@@ -481,6 +489,7 @@ def corr_torch_forward(
     ox = ox.view(1, 1, D, D, 1, 1)
     oy = oy.view(1, 1, D, D, 1, 1)
 
+    
     for m0 in range(0, M, chunk_size):
         m1 = min(m0 + chunk_size, M)
         mc = m1 - m0
@@ -539,8 +548,9 @@ def corr_torch_forward(
     return out.permute(0, 1, 3, 2, 4, 5)
 
 
+
 def corr_torch_forward_fp16(
-    fmap1, fmap2, coords, ii, jj, radius, chunk_size=1024
+    fmap1, fmap2, coords, ii, jj, radius, chunk_size=512
 ):
     """
     FP16, chunked, GPU-friendly correlation for DPVO.
@@ -570,7 +580,7 @@ def corr_torch_forward_fp16(
     # process in chunks
     # for m0 in range(0, M, chunk_size):
     
-    MAX_PATCHES = 8000
+    MAX_PATCHES = 10000
     m_start = max(0, M - MAX_PATCHES)
 
     for m0 in range(m_start, M, chunk_size):
