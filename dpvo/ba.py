@@ -1,6 +1,6 @@
 import torch
 from torch_scatter import scatter_sum
-
+from typing import Tuple, Union
 from . import fastba
 from . import lietorch
 from .lietorch import SE3
@@ -83,17 +83,56 @@ def block_show(A):
     plt.imshow(A[0].detach().cpu().numpy())
     plt.show()
 
-def BA(poses, patches, intrinsics, targets, weights, lmbda,
-       ii, jj, kk, bounds, ep=100.0, PRINT=False,
-       fixedp=1, structure_only=False):
-    """
-    Bundle Adjustment for DPVO
 
-    Solves:
+def BA(
+    poses: torch.Tensor,
+    patches: torch.Tensor,
+    intrinsics: torch.Tensor,
+    targets: torch.Tensor,
+    weights: torch.Tensor,
+    lmbda: Union[float, torch.Tensor],
+    ii: torch.Tensor,
+    jj: torch.Tensor,
+    kk: torch.Tensor,
+    bounds: Tuple[float, float, float, float],
+    ep: float = 100.0,
+    PRINT: bool = False,
+    fixedp: int = 1,
+    structure_only: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Bundle Adjustment (BA) solver used in DPVO.
+
+    Solves the Schur-complement system:
         [ B  E ] [ dX ] = [ v ]
         [ Eᵀ C ] [ dZ ]   [ w ]
 
-    using the Schur complement to eliminate structure (Z).
+    Args:
+        poses (torch.Tensor): Camera poses in se(3), shape (B, N, 6).
+        patches (torch.Tensor): Patch state (x, y, inverse_depth), shape (B, M, 3).
+        intrinsics (torch.Tensor): Camera intrinsics, shape (B, 4).
+        targets (torch.Tensor): Target pixel coordinates, shape (B, M, 2).
+        weights (torch.Tensor): Per-residual confidence weights, shape (B, M).
+        lmbda (float | torch.Tensor): Levenberg–Marquardt damping factor.
+        ii (torch.Tensor): Index of first pose per residual, shape (M,), dtype long.
+        jj (torch.Tensor): Index of second pose per residual, shape (M,), dtype long.
+        kk (torch.Tensor): Index of structure variable per residual, shape (M,), dtype long.
+        bounds (Tuple[float, float, float, float]): Valid image bounds (xmin, ymin, xmax, ymax).
+        ep (float, optional): Solver damping / convergence parameter, default 100.0.
+        PRINT (bool, optional): Print mean reprojection error if True, default False.
+        fixedp (int, optional): Number of initial poses to fix for gauge freedom, default 1.
+        structure_only (bool, optional): Update only inverse depth if True, default False.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            poses (torch.Tensor): Updated camera poses, shape (B, N, 6).
+            patches (torch.Tensor): Updated patches with refined inverse depth, shape (B, M, 3).
+
+    Notes:
+        - Assumes batch size B = 1.
+        - Structure Hessian is diagonal and inverted analytically.
+        - Uses dynamic indexing and scatter-add operations.
+        - Not suitable for static-shape accelerators (e.g., AMBA CV28).
     """
 
     # ---------------------------------------------------------
