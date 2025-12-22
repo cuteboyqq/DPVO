@@ -296,7 +296,14 @@ class DPVO:
 
     def corr(self, coords, indicies=None):
         """ local correlation volume """
-        ii, jj = indicies if indicies is not None else (self.pg.kk, self.pg.jj)
+        if indicies is not None:
+            ii, jj = indicies
+        else:
+            # Slice to active edges only
+            num_active = self.pg.num_edges
+            ii = self.pg.kk[:num_active]
+            jj = self.pg.jj[:num_active]
+        
         ii1 = ii % (self.M * self.pmem)
         jj1 = jj % (self.mem)
         corr1 = altcorr.corr(self.gmap, self.pyramid[0], coords / 1, ii1, jj1, 3)
@@ -305,34 +312,105 @@ class DPVO:
 
     def reproject(self, indicies=None):
         """ reproject patch k from i -> j """
-        (ii, jj, kk) = indicies if indicies is not None else (self.pg.ii, self.pg.jj, self.pg.kk)
+        if indicies is not None:
+            ii, jj, kk = indicies
+        else:
+            # Slice to active edges only
+            num_active = self.pg.num_edges
+            ii = self.pg.ii[:num_active]
+            jj = self.pg.jj[:num_active]
+            kk = self.pg.kk[:num_active]
         coords = pops.transform(SE3(self.poses), self.patches, self.intrinsics, ii, jj, kk)
         return coords.permute(0, 1, 4, 2, 3).contiguous()
 
     def append_factors(self, ii, jj):
-        self.pg.jj = torch.cat([self.pg.jj, jj])
-        self.pg.kk = torch.cat([self.pg.kk, ii])
-        self.pg.ii = torch.cat([self.pg.ii, self.ix[ii]])
+        """
+        FOR EXAMPLE :
+            Before append_factors():
+            num_edges = 5
+            Arrays: [ii: 0,1,2,3,4, 0,0,0,0,0, ...]  (max_edges=10)
+                    [jj: 1,2,3,4,5, 0,0,0,0,0, ...]
+                    [kk: 10,20,30,40,50, 0,0,0,0,0, ...]
+                    [net: [state1], [state2], ..., [state5], [0], [0], ...]
+                    
+            Call: append_factors(ii=[60, 70], jj=[6, 6])
+                - ii=[60, 70] = patch indices 60 and 70
+                - jj=[6, 6] = both patches observed in frame 6
+                - self.ix[60] and self.ix[70] = source frame indices (e.g., frame 4)
+            
+            After append_factors():
+            num_edges = 7
+            Arrays: [ii: 0,1,2,3,4, 4,4, 0,0,0, ...]  ← Added source frames
+                    [jj: 1,2,3,4,5, 6,6, 0,0,0, ...]  ← Added target frames
+                    [kk: 10,20,30,40,50, 60,70, 0,0,0, ...]  ← Added patch indices
+                    [net: [s1], [s2], ..., [s5], [0], [0], [0], [0], ...]  ← Initialized new states
+        """
+        num_new = len(ii)
+        if self.pg.num_edges + num_new > self.pg.max_edges:
+            raise RuntimeError(
+                f"Maximum edges ({self.pg.max_edges}) exceeded. "
+                f"Current: {self.pg.num_edges}, Adding: {num_new}. "
+                f"Increase MAX_EDGES in config."
+            )
+        
+        start_idx = self.pg.num_edges
+        end_idx = start_idx + num_new
+        
+        self.pg.jj[start_idx:end_idx] = jj
+        self.pg.kk[start_idx:end_idx] = ii
+        self.pg.ii[start_idx:end_idx] = self.ix[ii]
 
-        net = torch.zeros(1, len(ii), self.DIM, **self.kwargs)
-        self.pg.net = torch.cat([self.pg.net, net], dim=1)
+        # Initialize new net entries to zero
+        self.pg.net[:, start_idx:end_idx] = torch.zeros(1, num_new, self.DIM, **self.kwargs)
+        
+        self.pg.num_edges = end_idx
 
     def remove_factors(self, m, store: bool):
-        assert self.pg.ii.numel() == self.pg.weight.shape[1]
+        # m is a boolean mask - can be [num_edges] or [max_edges], we'll handle both
+        num_active = self.pg.num_edges
+        
+        # If mask is larger than active edges, slice it
+        if m.shape[0] > num_active:
+            m = m[:num_active]
+        elif m.shape[0] < num_active:
+            # Pad mask if smaller (shouldn't happen, but be safe)
+            m_padded = torch.zeros(num_active, dtype=torch.bool, device=m.device)
+            m_padded[:m.shape[0]] = m
+            m = m_padded
+        
         if store:
-            self.pg.ii_inac = torch.cat((self.pg.ii_inac, self.pg.ii[m]))
-            self.pg.jj_inac = torch.cat((self.pg.jj_inac, self.pg.jj[m]))
-            self.pg.kk_inac = torch.cat((self.pg.kk_inac, self.pg.kk[m]))
-            self.pg.weight_inac = torch.cat((self.pg.weight_inac, self.pg.weight[:,m]), dim=1)
-            self.pg.target_inac = torch.cat((self.pg.target_inac, self.pg.target[:,m]), dim=1)
-        self.pg.weight = self.pg.weight[:,~m]
-        self.pg.target = self.pg.target[:,~m]
-
-        self.pg.ii = self.pg.ii[~m]
-        self.pg.jj = self.pg.jj[~m]
-        self.pg.kk = self.pg.kk[~m]
-        self.pg.net = self.pg.net[:,~m]
-        assert self.pg.ii.numel() == self.pg.weight.shape[1]
+            num_to_store = m.sum().item()
+            if num_to_store > 0:
+                if self.pg.num_edges_inac + num_to_store > self.pg.max_edges:
+                    # If inactive buffer is full, just skip storing (or could truncate oldest)
+                    print(f"Warning: Inactive edge buffer full, not storing {num_to_store} edges")
+                else:
+                    start_inac = self.pg.num_edges_inac
+                    end_inac = start_inac + num_to_store
+                    
+                    # Only store active edges that are being removed
+                    self.pg.ii_inac[start_inac:end_inac] = self.pg.ii[:num_active][m]
+                    self.pg.jj_inac[start_inac:end_inac] = self.pg.jj[:num_active][m]
+                    self.pg.kk_inac[start_inac:end_inac] = self.pg.kk[:num_active][m]
+                    self.pg.weight_inac[:, start_inac:end_inac] = self.pg.weight[:, :num_active][:, m]
+                    self.pg.target_inac[:, start_inac:end_inac] = self.pg.target[:, :num_active][:, m]
+                    
+                    self.pg.num_edges_inac = end_inac
+        
+        # Compact active edges by moving remaining edges to fill gaps
+        keep_mask = ~m
+        num_keep = keep_mask.sum().item()
+        
+        if num_keep > 0 and num_keep < num_active:
+            # Move kept edges to the front
+            self.pg.ii[:num_keep] = self.pg.ii[:num_active][keep_mask]
+            self.pg.jj[:num_keep] = self.pg.jj[:num_active][keep_mask]
+            self.pg.kk[:num_keep] = self.pg.kk[:num_active][keep_mask]
+            self.pg.net[:, :num_keep] = self.pg.net[:, :num_active][:, keep_mask]
+            self.pg.weight[:, :num_keep] = self.pg.weight[:, :num_active][:, keep_mask]
+            self.pg.target[:, :num_keep] = self.pg.target[:, :num_active][:, keep_mask]
+        
+        self.pg.num_edges = num_keep
 
     def motion_probe(self):
         """ kinda hacky way to ensure enough motion for initialization """
@@ -352,21 +430,45 @@ class DPVO:
         return torch.quantile(delta.norm(dim=-1).float(), 0.5)
 
     def motionmag(self, i, j):
-        k = (self.pg.ii == i) & (self.pg.jj == j)
-        ii = self.pg.ii[k]
-        jj = self.pg.jj[k]
-        kk = self.pg.kk[k]
+        # Only check active edges
+        num_active = self.pg.num_edges
+        active_ii = self.pg.ii[:num_active]
+        active_jj = self.pg.jj[:num_active]
+        k = (active_ii == i) & (active_jj == j)
+        if k.sum() == 0:
+            return 0.0
+        ii = active_ii[k]
+        jj = active_jj[k]
+        kk = self.pg.kk[:num_active][k]
 
         flow, _ = pops.flow_mag(SE3(self.poses), self.patches, self.intrinsics, ii, jj, kk, beta=0.5)
         return flow.mean().item()
 
     def keyframe(self):
+        """
+        Before keyframe removal (n=10, KEYFRAME_INDEX=4):
+        Frames: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+                                ↑  ↑  ↑
+                                i  k  j  (checking frame 6)
+
+        If motion between frames 5↔7 is small:
+        - Frame 6 is redundant
+        - Remove frame 6
+        - Shift frames 7,8,9 → positions 6,7,8
+
+        After removal (n=9):
+        Frames: [0, 1, 2, 3, 4, 5, 6, 7, 8]
+                                   ↑  ↑  ↑
+                                (was 7) (was 8) (was 9)
+        """
 
         i = self.n - self.cfg.KEYFRAME_INDEX - 1
         j = self.n - self.cfg.KEYFRAME_INDEX + 1
-        m = self.motionmag(i, j) + self.motionmag(j, i)
+        # bidirectional motion magnitude (average of both directions)
+        m = self.motionmag(i, j) + self.motionmag(j, i) # optical flow magnitude from frame i to j & add j to i
  
-        if m / 2 < self.cfg.KEYFRAME_THRESH:
+        if m / 2 < self.cfg.KEYFRAME_THRESH: 
+            # the candidate frame is redundant and can be removed
             k = self.n - self.cfg.KEYFRAME_INDEX
             t0 = self.pg.tstamps_[k-1]
             t1 = self.pg.tstamps_[k]
@@ -374,14 +476,34 @@ class DPVO:
             dP = SE3(self.pg.poses_[k]) * SE3(self.pg.poses_[k-1]).inv()
             self.pg.delta[t1] = (t0, dP)
 
-            to_remove = (self.pg.ii == k) | (self.pg.jj == k)
-            self.remove_factors(to_remove, store=False)
+            # Only check active edges
+            num_active = self.pg.num_edges
+            active_ii = self.pg.ii[:num_active]
+            active_jj = self.pg.jj[:num_active]
+            to_remove = (active_ii == k) | (active_jj == k)
+            # Pad to full size for remove_factors
+            to_remove_full = torch.zeros(self.pg.max_edges, dtype=torch.bool, device="cuda")
+            to_remove_full[:num_active] = to_remove
+            self.remove_factors(to_remove_full, store=False) # store=False means these edges are not moved to inactive storage
 
-            self.pg.kk[self.pg.ii > k] -= self.M
-            self.pg.ii[self.pg.ii > k] -= 1
-            self.pg.jj[self.pg.jj > k] -= 1
+            # Update indices for remaining active edges
+            num_active = self.pg.num_edges
+            if num_active > 0:
+                # Create views for easier indexing
+                active_ii = self.pg.ii[:num_active]
+                active_jj = self.pg.jj[:num_active]
+                active_kk = self.pg.kk[:num_active]
+                
+                mask_ii = active_ii > k
+                mask_jj = active_jj > k
+                # Update in-place on the actual tensor slices
+                active_kk[mask_ii] -= self.M
+                active_ii[mask_ii] -= 1
+                active_jj[mask_jj] -= 1
 
             for i in range(k, self.n-1):
+                # Shifts all frame data backward to fill the gap left by frame k
+                # Updates timestamps, colors, poses, patches, intrinsics, and feature maps
                 self.pg.tstamps_[i] = self.pg.tstamps_[i+1]
                 self.pg.colors_[i] = self.pg.colors_[i+1]
                 self.pg.poses_[i] = self.pg.poses_[i+1]
@@ -392,38 +514,55 @@ class DPVO:
                 self.gmap_[i % self.pmem] = self.gmap_[(i+1) % self.pmem]
                 self.fmap1_[0,i%self.mem] = self.fmap1_[0,(i+1)%self.mem]
                 self.fmap2_[0,i%self.mem] = self.fmap2_[0,(i+1)%self.mem]
-
+            # Step 8: Update Counters (Lines 481-482)
             self.n -= 1
             self.m-= self.M
 
             if self.cfg.CLASSIC_LOOP_CLOSURE:
                 self.long_term_lc.keyframe(k)
 
-        to_remove = self.ix[self.pg.kk] < self.n - self.cfg.REMOVAL_WINDOW # Remove edges falling outside the optimization window
+        # Only check active edges
+        num_active = self.pg.num_edges
+        active_kk = self.pg.kk[:num_active]
+        active_ii = self.pg.ii[:num_active]
+        active_jj = self.pg.jj[:num_active]
+        
+        to_remove = self.ix[active_kk] < self.n - self.cfg.REMOVAL_WINDOW # Remove edges falling outside the optimization window
         if self.cfg.LOOP_CLOSURE:
             # ...unless they are being used for loop closure
-            lc_edges = ((self.pg.jj - self.pg.ii) > 30) & (self.pg.jj > (self.n - self.cfg.OPTIMIZATION_WINDOW))
+            lc_edges = ((active_jj - active_ii) > 30) & (active_jj > (self.n - self.cfg.OPTIMIZATION_WINDOW))
             to_remove = to_remove & ~lc_edges
-        self.remove_factors(to_remove, store=True)
+        
+        # Pad to full size for remove_factors
+        to_remove_full = torch.zeros(self.pg.max_edges, dtype=torch.bool, device="cuda")
+        to_remove_full[:num_active] = to_remove
+        self.remove_factors(to_remove_full, store=True)
 
     def __run_global_BA(self):
         """ Global bundle adjustment
          Includes both active and inactive edges """
-        full_target = torch.cat((self.pg.target_inac, self.pg.target), dim=1)
-        full_weight = torch.cat((self.pg.weight_inac, self.pg.weight), dim=1)
-        full_ii = torch.cat((self.pg.ii_inac, self.pg.ii))
-        full_jj = torch.cat((self.pg.jj_inac, self.pg.jj))
-        full_kk = torch.cat((self.pg.kk_inac, self.pg.kk))
+        num_active = self.pg.num_edges
+        num_inac = self.pg.num_edges_inac
+        total_edges = num_active + num_inac
+        
+        # Concatenate active and inactive edges (sliced to actual sizes)
+        full_target = torch.cat((self.pg.target_inac[:, :num_inac], self.pg.target[:, :num_active]), dim=1)
+        full_weight = torch.cat((self.pg.weight_inac[:, :num_inac], self.pg.weight[:, :num_active]), dim=1)
+        full_ii = torch.cat((self.pg.ii_inac[:num_inac], self.pg.ii[:num_active]))
+        full_jj = torch.cat((self.pg.jj_inac[:num_inac], self.pg.jj[:num_active]))
+        full_kk = torch.cat((self.pg.kk_inac[:num_inac], self.pg.kk[:num_active]))
 
         self.pg.normalize()
         lmbda = torch.as_tensor([1e-4], device="cuda")
-        t0 = self.pg.ii.min().item()
-        fastba.BA(self.poses, self.patches, self.intrinsics,
-            full_target, full_weight, lmbda, full_ii, full_jj, full_kk, t0, self.n, M=self.M, iterations=2, eff_impl=True)
+        t0 = full_ii.min().item() if total_edges > 0 else 0
+        if total_edges > 0:
+            fastba.BA(self.poses, self.patches, self.intrinsics,
+                full_target, full_weight, lmbda, full_ii, full_jj, full_kk, t0, self.n, M=self.M, iterations=2, eff_impl=True)
         self.ran_global_ba[self.n] = True
 
     
     def _check_pg_static_shape(self):
+        # With static shapes, these should always be the same
         shapes = (
             tuple(self.pg.ii.shape),
             tuple(self.pg.jj.shape),
@@ -432,39 +571,58 @@ class DPVO:
 
         if self._pg_shape_ref is None:
             self._pg_shape_ref = shapes
-            print(f"[PG SHAPE INIT] ii/jj/kk shapes = {shapes}")
+            print(f"[PG SHAPE INIT] ii/jj/kk shapes = {shapes} (static, num_edges={self.pg.num_edges})")
         else:
-            if shapes != self._pg_shape_ref:
-                print(
-                    "[PG SHAPE CHANGE DETECTED]\n"
-                    f"  previous = {self._pg_shape_ref}\n"
-                    f"  current  = {shapes}"
-                )
-                self._pg_shape_ref = shapes
+            # Shapes should be static now, but check anyway
+            # if shapes != self._pg_shape_ref:
+            print(
+                "[PG SHAPE CHANGE DETECTED - UNEXPECTED!]\n"
+                f"  previous = {self._pg_shape_ref}\n"
+                f"  current  = {shapes}"
+            )
+            self._pg_shape_ref = shapes
+            # Log active edge count for debugging
+            if self.pg.num_edges != getattr(self, '_last_num_edges', 0):
+                print(f"[PG ACTIVE EDGES] {self.pg.num_edges}/{self.pg.max_edges}")
+                self._last_num_edges = self.pg.num_edges
     
     
     def update(self):
+        num_active = self.pg.num_edges
+        if num_active == 0:
+            return
+            
         with Timer("other", enabled=self.enable_timing):
             coords = self.reproject()
 
             with autocast(enabled=True):
                 self._check_pg_static_shape()
                 corr = self.corr(coords)
-                ctx = self.imap[:, self.pg.kk % (self.M * self.pmem)]
-                self.pg.net, (delta, weight, _) = \
-                    self.network.update(self.pg.net, ctx, corr, None, self.pg.ii, self.pg.jj, self.pg.kk)
+                # Slice to active edges only
+                active_kk = self.pg.kk[:num_active]
+                active_ii = self.pg.ii[:num_active]
+                active_jj = self.pg.jj[:num_active]
+                ctx = self.imap[:, active_kk % (self.M * self.pmem)]
+                
+                # Slice net to active edges for update
+                active_net = self.pg.net[:, :num_active]
+                active_net, (delta, weight, _) = \
+                    self.network.update(active_net, ctx, corr, None, active_ii, active_jj, active_kk)
+                # Write back to full tensor
+                self.pg.net[:, :num_active] = active_net
 
             lmbda = torch.as_tensor([1e-4], device="cuda")
             weight = weight.float()
             target = coords[...,self.P//2,self.P//2] + delta.float()
 
-        self.pg.target = target
-        self.pg.weight = weight
+        # Store target and weight (sliced to active edges)
+        self.pg.target[:, :num_active] = target
+        self.pg.weight[:, :num_active] = weight
 
         with Timer("BA", enabled=self.enable_timing):
             try:
                 # run global bundle adjustment if there exist long-range edges
-                if (self.pg.ii < self.n - self.cfg.REMOVAL_WINDOW - 1).any() and not self.ran_global_ba[self.n]:
+                if (active_ii < self.n - self.cfg.REMOVAL_WINDOW - 1).any() and not self.ran_global_ba[self.n]:
                     self.__run_global_BA()
                 else:
                     t0 = self.n - self.cfg.OPTIMIZATION_WINDOW if self.is_initialized else 1
@@ -473,7 +631,7 @@ class DPVO:
                     #     target, weight, lmbda, self.pg.ii, self.pg.jj, self.pg.kk, t0, self.n, M=self.M, iterations=2, eff_impl=False)
                     '''Use python torch BA function from ba.py, Alister 2025-12-15 updated'''
                     new_poses = python_ba_wrapper(self.poses, self.patches, self.intrinsics, target, weight,
-                                        lmbda, self.pg.ii, self.pg.jj, self.pg.kk, PPF=None, t0=t0, t1=self.n, iterations=2, eff_impl=False)
+                                        lmbda, active_ii, active_jj, active_kk, PPF=None, t0=t0, t1=self.n, iterations=1, eff_impl=False)
                     
                     # print(type(new_poses))
                     # print(dir(new_poses))
@@ -583,6 +741,18 @@ class DPVO:
                     self.append_factors(lii, ljj)
 
         # Add forward and backward factors
+        """
+        Why Both Are Needed
+           1. Forward edges: track old patches into the new frame
+           2. Backward edges: track new patches back into old frames
+            Together they create bidirectional constraints for bundle adjustment.
+        Example :
+            After calling both functions with n=10, M=48, r=6:
+
+                Forward edges:  240 edges (old patches → frame 9)
+                Backward edges: 288 edges (new patches → old frames)
+                Total:          528 new edges added
+        """
         self.append_factors(*self.__edges_forw())
         self.append_factors(*self.__edges_back())
 
@@ -595,6 +765,16 @@ class DPVO:
         elif self.is_initialized:
             self.update()
             self.keyframe()
+        """
+        Summary
+        If keyframe() is not called:
+        Frames accumulate → crash at BUFFER_SIZE
+        Edges accumulate → crash at MAX_EDGES or severe slowdown
+        Performance degrades → slower BA and correlation
+        Memory grows → potential OOM
+        keyframe() is essential for maintaining bounded memory and performance. 
+        It should be called after every update() when the system is initialized (as it currently is on line 734).
+        """
 
         if self.cfg.CLASSIC_LOOP_CLOSURE:
             self.long_term_lc.attempt_loop_closure(self.n)
