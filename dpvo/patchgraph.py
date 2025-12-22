@@ -41,17 +41,26 @@ class PatchGraph:
         self.delta = {}
 
         ### edge information ###
-        self.net = torch.zeros(1, 0, DIM, **kwargs)
-        self.ii = torch.as_tensor([], dtype=torch.long, device="cuda")
-        self.jj = torch.as_tensor([], dtype=torch.long, device="cuda")
-        self.kk = torch.as_tensor([], dtype=torch.long, device="cuda")
+        # Static shape support for AMBA CV28 - pre-allocate fixed-size tensors
+        max_edges = getattr(cfg, 'MAX_EDGES', 10000)
+        self.max_edges = max_edges
+        self.num_edges = 0  # Track number of active edges
+        
+        self.net = torch.zeros(1, max_edges, DIM, **kwargs)
+        self.ii = torch.zeros(max_edges, dtype=torch.long, device="cuda")
+        self.jj = torch.zeros(max_edges, dtype=torch.long, device="cuda")
+        self.kk = torch.zeros(max_edges, dtype=torch.long, device="cuda")
+        self.weight = torch.zeros(1, max_edges, 2, **kwargs)
+        self.target = torch.zeros(1, max_edges, 2, **kwargs)
 
         ### inactive edge information (i.e., no longer updated, but useful for BA) ###
-        self.ii_inac = torch.as_tensor([], dtype=torch.long, device="cuda")
-        self.jj_inac = torch.as_tensor([], dtype=torch.long, device="cuda")
-        self.kk_inac = torch.as_tensor([], dtype=torch.long, device="cuda")
-        self.weight_inac = torch.zeros(1, 0, 2, dtype=torch.long, device="cuda")
-        self.target_inac = torch.zeros(1, 0, 2, dtype=torch.long, device="cuda")
+        # Also use static shapes for inactive edges
+        self.num_edges_inac = 0
+        self.ii_inac = torch.zeros(max_edges, dtype=torch.long, device="cuda")
+        self.jj_inac = torch.zeros(max_edges, dtype=torch.long, device="cuda")
+        self.kk_inac = torch.zeros(max_edges, dtype=torch.long, device="cuda")
+        self.weight_inac = torch.zeros(1, max_edges, 2, **kwargs)
+        self.target_inac = torch.zeros(1, max_edges, 2, **kwargs)
 
     def edges_loop(self):
         """ Adding edges from old patches to new frames """
