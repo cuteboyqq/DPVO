@@ -324,6 +324,7 @@ class DPVO:
         return coords.permute(0, 1, 4, 2, 3).contiguous()
 
     def append_factors(self, ii, jj):
+        # (ii,jj) : (patch_indices, frame_indices) pairs
         """
         FOR EXAMPLE :
             Before append_factors():
@@ -646,6 +647,34 @@ class DPVO:
             self.pg.points_[:len(points)] = points[:]
 
     def __edges_forw(self):
+        """
+        What it does:
+            Selects old patches: patches from frames (n-r) to (n-1)
+                t0 = M * (n - r): first patch index in the range
+                t1 = M * (n - 1): last patch index in the range
+                Connects to new frame: frame n-1 (the frame just added)
+            Returns: (patch_indices, frame_indices) pairs
+            Example:
+                Assume:
+                    n = 10 (current frame count, frame 9 is the newest)
+                    M = 48 (patches per frame)
+                    PATCH_LIFETIME = 6
+                Calculation:
+                    t0 = 48 * (10 - 6) = 48 * 4 = 192 (first patch from frame 4)
+                    t1 = 48 * (10 - 1) = 48 * 9 = 432 (last patch from frame 9)
+                    Patches: [192, 193, ..., 431] (240 patches = 5 frames × 48)
+                    Target frame: [9] (frame 9)
+                Result:
+                    Creates 240 edges connecting patches [192-431] → frame 9
+                    Each old patch is observed in the new frame
+        
+        Visual:
+            Frames:  [4]  [5]  [6]  [7]  [8]  [9] ← new frame
+            Patches: 192  240  288  336  384  432
+                      ↓    ↓    ↓    ↓    ↓
+                      └────┴────┴────┴────┴────→ Frame 9
+                    (All old patches connected to new frame)
+        """
         r=self.cfg.PATCH_LIFETIME
         t0 = self.M * max((self.n - r), 0)
         t1 = self.M * max((self.n - 1), 0)
@@ -654,6 +683,30 @@ class DPVO:
             torch.arange(self.n-1, self.n, device="cuda"), indexing='ij')
 
     def __edges_back(self):
+        """
+        What it does:
+            1. Selects new patches: patches from frame n-1 (the newest frame)
+                - t0 = M * (n - 1): first patch of frame n-1
+                - t1 = M * n: first patch of frame n (exclusive)
+            2. Connects to old frames: frames from max(n-r, 0) to n-1
+            3. Returns: (patch_indices, frame_indices) pairs
+            Example:
+                Same setup:
+                n = 10, M = 48, PATCH_LIFETIME = 6
+                Calculation:
+                    - t0 = 48 * (10 - 1) = 432 (first patch of frame 9)
+                    - t1 = 48 * 10 = 480 (first patch of frame 10, exclusive)
+                New patches: [432, 433, ..., 479] (48 patches from frame 9)
+                Target frames: [4, 5, 6, 7, 8, 9] (last 6 frames)
+                Result:
+                    Creates 48 × 6 = 288 edges connecting new patches [432-479] → frames [4-9]
+                    Each new patch is observed in multiple old frames
+        Visual:
+            New Patches (Frame 9):  432, 433, ..., 479 (48 patches)
+                                     ↓    ↓   ...  ↓
+            Old Frames:             [4] [5] [6] [7] [8] [9]
+                                (Each new patch → all old frames)
+        """
         r=self.cfg.PATCH_LIFETIME
         t0 = self.M * max((self.n - 1), 0)
         t1 = self.M * max((self.n - 0), 0)
