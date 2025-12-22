@@ -87,37 +87,73 @@ __global__ void corr_forward_kernel(int R,
     const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> us,
     const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> vs,
     torch::PackedTensorAccessor32<scalar_t,6,torch::RestrictPtrTraits> corr)
+    """
+    Parameters:
+      R: Correlation radius (e.g., 3 → 7×7 window)
+      fmap1: Patch features [B, ?, C, H, W] (from gmap)
+      fmap2: Frame features [B, ?, C, H2, W2] (from pyramid)
+      coords: Reprojected coordinates [B, M, 2, H, W] (x, y for each pixel)
+      us: Patch indices (which patches to use from fmap1)
+      vs: Frame indices (which frames to use from fmap2)
+      corr: Output correlation volume [B, M, D, D, H, W]
+    """
 {
+  """
+  Step 1: Calculate Dimensions 
+  """
   // diameter
-  const int D = 2*R + 2;
+  const int D = 2*R + 2; // Correlation window diameter (e.g., 2*3+2 = 8)
 
-  const int B = coords.size(0);
-  const int M = coords.size(1);
-  const int H = coords.size(3);
-  const int W = coords.size(4);
+  const int B = coords.size(0); // Batch size (usually 1)
+  const int M = coords.size(1); // Number of patches (ex: 48)
+  const int H = coords.size(3); // Patch height (usually 3)
+  const int W = coords.size(4); // Patch width (usually 3)
 
-  const int C = fmap1.size(2);
-  const int H2 = fmap2.size(3);
-  const int W2 = fmap2.size(4);
+  const int C = fmap1.size(2); // Feature channels (128)
+  const int H2 = fmap2.size(3); // Frame height
+  const int W2 = fmap2.size(4);// Frame width
 
-  int n = blockIdx.x * blockDim.x + threadIdx.x;
+  int n = blockIdx.x * blockDim.x + threadIdx.x; // Global thread ID
 
   if (n < B * M * H * W * D * D) {
-    const int jj = n % D; n /= D;
-    const int ii = n % D; n /= D;
-    const int j0 = n % W; n /= W;
-    const int i0 = n % H; n /= H;
-    const int  m = n % M; n /= M;
+    """
+    Step 2: Thread Indexing
+            Each thread computes one correlation value:
+            For one patch pixel (i0, j0)
+            At one offset (ii, jj) in the correlation window
+            For one edge m
+    """
+    const int jj = n % D; n /= D; // Offset in correlation window (0 to D-1)
+    const int ii = n % D; n /= D; // Offset in correlation window (0 to D-1)
+    const int j0 = n % W; n /= W; // Pixel x in patch (0 to W-1)
+    const int i0 = n % H; n /= H; // Pixel y in patch (0 to H-1)
+    const int  m = n % M; n /= M; // Edge/patch index (0 to M-1)
 
-    const int ix = us[m];
-    const int jx = vs[m];
+    """
+    Step 3: Get Feature Indices 
+             Selects which patch and frame to correlate.
+    """
+    const int ix = us[m]; // Which patch from fmap1 to use
+    const int jx = vs[m]; // Which frame from fmap2 to use
 
-    const float x = coords[n][m][0][i0][j0];
-    const float y = coords[n][m][1][i0][j0];
-
+    """
+    Step 4: Get Reprojected Coordinate
+            Gets the predicted location in the target frame for this patch pixel
+    """
+    const float x = coords[n][m][0][i0][j0]; // X coordinate for this pixel
+    const float y = coords[n][m][1][i0][j0]; // Y coordinate for this pixel
+    """
+    Step 5: Calculate Sampling Location
+        Computes where to sample in fmap2:
+        floor(y), floor(x): Base location from reprojection
+        (ii - R), (jj - R): Offset in correlation window (e.g., -3 to +4 for R=3)
+        Example: If x=10.3, y=20.7, R=3, ii=5, jj=2:
+          i1 = floor(20.7) + (5-3) = 20 + 2 = 22
+          j1 = floor(10.3) + (2-3) = 10 + (-1) = 9
+    """
     const int i1 = static_cast<int>(floor(y)) + (ii - R);
     const int j1 = static_cast<int>(floor(x)) + (jj - R);
-
+    
     scalar_t s = 0;
     if (within_bounds(i1, j1, H2, W2)) {
 
