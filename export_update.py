@@ -51,62 +51,67 @@ def neighbors_tensor(ii: torch.Tensor, jj: torch.Tensor):
     return ix.to(torch.int64), jx.to(torch.int64)
 
 
+
 class SoftAggONNX(nn.Module):
-    def __init__(self, dim=512, expand=False):
+    def __init__(self, dim=512, expand=True):
         super().__init__()
+        self.expand = expand
         self.f = nn.Linear(dim, dim)
         self.g = nn.Linear(dim, dim)
         self.h = nn.Linear(dim, dim)
-        self.expand = expand
 
     def forward(self, x, ix):
         """
-        x  : [B, N, C]
-        ix : [N]   int32 (group index)
+        x  : [N, C] or [B, N, C]
+        ix : [N]  (sparse group indices, e.g., kk/ii/jj)
+        Returns:
+            - if expand=True: [N, C] or [B, N, C]
+            - else: [G, C] or [B, G, C], G = number of unique groups
         """
-        B, N, C = x.shape
+
+        is_batched = x.dim() == 3
         device = x.device
         dtype = x.dtype
 
-        # --------------------------
-        # 1️⃣ Ensure int64 indices and clamp
-        # --------------------------
-        jx = ix.to(torch.int64)
-        jx = torch.clamp(jx, min=0, max=N-1)
+        # 1️⃣ compress group indices to 0..G-1
+        unique_ix, idx_map = torch.unique(ix, return_inverse=True)
+        G = unique_ix.numel()
 
-        # --------------------------
-        # 2️⃣ Compute logits
-        # --------------------------
-        logits = self.g(x)
-        exp_logits = torch.exp(logits)
-
-        # --------------------------
-        # 3️⃣ Preallocate denominator with static shape [B, N, C]
-        # --------------------------
-        denom = torch.zeros((B, N, C), device=device, dtype=dtype)
-        jx_expand = jx.view(1, N, 1).expand(B, N, C)
-        jx_expand = torch.clamp(jx_expand, 0, N-1)
-        denom.scatter_add_(1, jx_expand, exp_logits)
-
-        # safe division
-        w = exp_logits / torch.clamp(denom, min=1e-6)
-
-        # --------------------------
-        # 4️⃣ Weighted scatter sum
-        # --------------------------
+        # 2️⃣ compute projections
         fx = self.f(x)
-        weighted = fx * w
-        y = torch.zeros((B, N, C), device=device, dtype=dtype)
-        y.scatter_add_(1, jx_expand, weighted)
+        gx = self.g(x)
 
-        # --------------------------
-        # 5️⃣ Output
-        # --------------------------
+        # 3️⃣ FP16-safe exponential
+        if dtype == torch.float16:
+            gx = torch.clamp(gx, -50.0, 50.0)
+        exp_gx = torch.exp(gx)
+
+        # 4️⃣ prepare group sum and output
+        if is_batched:
+            B, N, C = x.shape
+            denom = torch.zeros(B, G, C, device=device, dtype=dtype)
+            y = torch.zeros(B, G, C, device=device, dtype=dtype)
+
+            # iterate over batch dimension (small in DPVO)
+            for b in range(B):
+                # compute denominator per group
+                denom[b].index_add_(0, idx_map, exp_gx[b])
+                # compute weighted sum per group
+                y[b].index_add_(0, idx_map, fx[b] * (exp_gx[b] / denom[b, idx_map, :]))
+
+        else:  # [N, C]
+            N, C = x.shape
+            denom = torch.zeros(G, C, device=device, dtype=dtype)
+            y = torch.zeros(G, C, device=device, dtype=dtype)
+            denom.index_add_(0, idx_map, exp_gx)
+            y.index_add_(0, idx_map, fx * (exp_gx / denom[idx_map, :]))
+
+        # 5️⃣ final projection
         y = self.h(y)
 
+        # 6️⃣ expand back if needed
         if self.expand:
-            # gather back to original positions
-            y = torch.gather(y, 1, jx_expand)
+            return y[:, idx_map, :] if is_batched else y[idx_map]
 
         return y
 
@@ -153,8 +158,8 @@ class UpdateONNX(nn.Module):
         # compute neighbors
         ix, jx = neighbors_tensor(kk, jj)
 
-        mask_ix = torch.ones_like(ix, dtype=net.dtype).view(1, -1, 1)  # use full mask
-        mask_jx = torch.ones_like(jx, dtype=net.dtype).view(1, -1, 1)
+        # mask_ix = torch.ones_like(ix, dtype=net.dtype).view(1, -1, 1)  # use full mask
+        # mask_jx = torch.ones_like(jx, dtype=net.dtype).view(1, -1, 1)
 
         # clamp indices to [0, H-1] for CV28
         ix = torch.clamp(ix, 0, net.shape[1]-1)
@@ -254,7 +259,7 @@ def main():
                         help='Path to DPVO model file (default: dpvo.pth)')
     parser.add_argument('--output_dir', type=str, default='./onnx_models',
                         help='Output directory for ONNX models (default: ./onnx_models)')
-    parser.add_argument('--max_edges', type=int, default=1500,
+    parser.add_argument('--max_edges', type=int, default=756,
                         help='Maximum number of edges (static shape for AMBA CV28, default: 3000)')
     parser.add_argument('--patch_size', type=int, default=3,
                         help='Patch size p (default: 3)')
