@@ -4,6 +4,7 @@ from typing import Tuple, Union
 from . import fastba
 from . import lietorch
 from .lietorch import SE3
+from typing import Optional
 
 from .utils import Timer
 
@@ -295,29 +296,46 @@ def BA(
 
     return poses, patches
 
-
 def python_ba_wrapper(
-    poses,
-    patches,
-    intrinsics,
-    target,
-    weight,
-    lmbda,
-    ii,
-    jj,
-    kk,
-    PPF,          # unused (CUDA-specific)
-    t0,
-    t1,
-    iterations,
-    eff_impl=False  # ignored, Python BA is dense
-):
+    poses: Union[torch.Tensor, SE3],
+    patches: torch.Tensor,
+    intrinsics: torch.Tensor,
+    target: torch.Tensor,
+    weight: torch.Tensor,
+    lmbda: Union[torch.Tensor, float],
+    ii: torch.Tensor,
+    jj: torch.Tensor,
+    kk: torch.Tensor,
+    PPF: Optional[object],
+    t0: int,
+    t1: int,
+    iterations: int,
+    eff_impl: bool = False
+) -> torch.Tensor:
     """
-    Python replacement for CUDA fastba.BA
-    Mirrors CUDA API and semantics.
-    Updates poses and patches IN-PLACE.
-    Returns None (like CUDA).
+    Python replacement for CUDA fastba.BA.
+
+    Args:
+        poses: Camera poses (Tensor [N,7] or SE3 wrapper).
+        patches: Patch parameters, updated in-place.
+        intrinsics: Camera intrinsics tensor [fx, fy, cx, cy].
+        target: Target pixel coordinates for reprojection.
+        weight: Residual weights.
+        lmbda: Levenberg–Marquardt damping factor.
+        ii: Source frame index where the patch is anchored.
+        jj: Target frame index where the patch is reprojected.
+        kk: Patch index corresponding to the source frame.
+        PPF: CUDA-only argument (ignored in Python).
+        t0: First fixed pose index.
+        t1: Last fixed pose index.
+        iterations: Number of BA iterations.
+        eff_impl: Ignored (Python BA is dense).
+
+    Returns:
+        Updated poses tensor (same semantics as CUDA BA).
     """
+    ...
+
     if isinstance(poses, torch.Tensor):
         poses = SE3(poses)
     else:
