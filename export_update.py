@@ -142,7 +142,32 @@ class UpdateONNX(nn.Module):
         self.d = nn.Sequential(nn.ReLU(inplace=False), nn.Linear(DIM, 2), GradientClip())
         self.w = nn.Sequential(nn.ReLU(inplace=False), nn.Linear(DIM, 2), GradientClip(), nn.Sigmoid())
 
-    def forward(self, net, inp, corr, ii, jj, kk):
+    def forward(
+        self,
+        net: torch.Tensor,
+        inp: torch.Tensor,
+        corr: torch.Tensor,
+        ii: torch.Tensor,
+        jj: torch.Tensor,
+        kk: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Forward pass of UpdateONNX module.
+        
+        Args:
+            net: torch.Tensor - Network hidden state, shape [1, DIM, H, 1] where DIM=384 and H is the number of edges. Type: float32
+            inp: torch.Tensor - Input features (imap), shape [1, DIM, H, 1]. Type: float32
+            corr: torch.Tensor - Correlation features, shape [1, corr_dim, H, 1] where corr_dim = 2*49*p*p (882 for p=3). Type: float32
+            ii: torch.Tensor - Source frame indices, shape [1, H, 1]. Type: int32
+            jj: torch.Tensor - Target frame indices, shape [1, H, 1]. Type: int32
+            kk: torch.Tensor - Patch indices, shape [1, H, 1]. Type: int32
+        
+        Returns:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                - net_out: Updated network state, shape [1, DIM, H, 1] if export_onnx=True, or [1, H, DIM] if export_onnx=False
+                - d_out: Position correction (delta), shape [1, 2, H, 1] if export_onnx=True, or [1, H, 2] if export_onnx=False
+                - w_out: Confidence weights, shape [1, 2, H, 1] if export_onnx=True, or [1, H, 2] if export_onnx=False
+        """
         # CV28 input reshape (4D -> 3D)
         net  = net.squeeze(-1).permute(0, 2, 1)
         inp  = inp.squeeze(-1).permute(0, 2, 1)
@@ -180,9 +205,37 @@ class UpdateONNX(nn.Module):
         w_out = self.w(net)
 
         if self.export_onnx:
-            net_out = net.permute(0, 2, 1).unsqueeze(-1)
-            d_out = d_out.permute(0, 2, 1).unsqueeze(-1)
-            w_out = w_out.permute(0, 2, 1).unsqueeze(-1)
+            # Ensure static shapes for ONNX export
+            # net: [1, N, DIM] -> [1, DIM, N, 1] (N: number of edges, example : 756 or 1024) (DIM : 384)
+            # d_out: [1, N, 2] -> [1, 2, N, 1]
+            # w_out: [1, N, 2] -> [1, 2, N, 1]
+            
+            # Get explicit shapes to help ONNX infer static dimensions
+            B, N, C = net.shape
+            B_d, N_d, C_d = d_out.shape
+            
+            # Use explicit reshape with known dimensions to ensure ONNX sees static shapes
+            # This is critical for ONNX to infer static output shapes
+            # Method: permute -> unsqueeze -> explicit reshape with known dimensions
+            
+            # net_out: [1, N, DIM] -> [1, DIM, N, 1]
+            net_out = net.permute(0, 2, 1).contiguous()  # [1, DIM, N]
+            net_out = net_out.unsqueeze(-1)  # [1, DIM, N, 1]
+            # Explicit reshape with known static dimensions
+            net_out = net_out.view(B, C, N, 1) # B=1, C=DIM
+            
+            # d_out: [1, N, 2] -> [1, 2, N, 1]
+            d_out = d_out.permute(0, 2, 1).contiguous()  # [1, 2, N]
+            d_out = d_out.unsqueeze(-1)  # [1, 2, N, 1]
+            # Explicit reshape with known static dimensions
+            d_out = d_out.view(B_d, C_d, N_d, 1)
+            
+            # w_out: [1, N, 2] -> [1, 2, N, 1]
+            w_out = w_out.permute(0, 2, 1).contiguous()  # [1, 2, N]
+            w_out = w_out.unsqueeze(-1)  # [1, 2, N, 1]
+            # Explicit reshape with known static dimensions
+            w_out = w_out.view(B_d, C_d, N_d, 1)
+            
             return net_out, d_out, w_out
 
         return net, (d_out, w_out, None)
@@ -217,6 +270,15 @@ def export_to_onnx(model, dummy_inputs, output_path, input_names, output_names, 
 
     # Export with static shapes (no dynamic axes) for AMBA CV28
     if static_shape:
+        # Test forward pass to verify shapes
+        print(f"  Testing forward pass...")
+        with torch.no_grad():
+            outputs = model(*dummy_inputs)
+            print(f"  Output shapes from forward pass:")
+            for name, out in zip(output_names, outputs):
+                print(f"    {name}: {tuple(out.shape)} dtype={out.dtype}")
+        
+        # Export directly - torch.jit.trace might not work with loops in SoftAggONNX
         torch.onnx.export(
             model,
             dummy_inputs,
@@ -224,8 +286,49 @@ def export_to_onnx(model, dummy_inputs, output_path, input_names, output_names, 
             input_names=input_names,
             output_names=output_names,
             dynamic_axes=None,  # ❌ Do NOT use dynamic axes for CV28
-            opset_version=opset_version
+            opset_version=opset_version,
+            do_constant_folding=False,  # Disable constant folding to preserve shapes
+            export_params=True,  # Export parameters
+            verbose=False
         )
+        
+        # Post-process ONNX model to ensure static shapes
+        print(f"  Post-processing ONNX model to fix output shapes...")
+        try:
+            import onnx
+            from onnx import helper
+            
+            onnx_model = onnx.load(output_path)
+            
+            # Get expected output shapes from forward pass
+            with torch.no_grad():
+                test_outputs = model(*dummy_inputs)
+                expected_shapes = {name: tuple(out.shape) for name, out in zip(output_names, test_outputs)}
+            
+            # Fix output shapes to be static
+            for i, output in enumerate(onnx_model.graph.output):
+                if output.name in expected_shapes:
+                    expected_shape = expected_shapes[output.name]
+                    print(f"    Fixing output '{output.name}' shape to {expected_shape}")
+                    
+                    # Create new tensor type with static shape
+                    shape_proto = helper.make_tensor_value_info(
+                        output.name,
+                        output.type.tensor_type.elem_type,
+                        expected_shape
+                    )
+                    
+                    # Replace the output type
+                    onnx_model.graph.output[i].CopyFrom(shape_proto)
+            
+            # Save the fixed model
+            onnx.save(onnx_model, output_path)
+            print(f"  ✓ ONNX model post-processed with static output shapes")
+        except Exception as e:
+            print(f"  ⚠️  Post-processing failed: {e}")
+            import traceback
+            traceback.print_exc()
+            print(f"  Model exported but shapes may be dynamic - check manually")
     else:
         # Dynamic shapes (for testing/debugging)
         dynamic_axes = {
