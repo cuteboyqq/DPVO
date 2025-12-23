@@ -40,8 +40,8 @@ class Update(nn.Module):
         
         self.norm = nn.LayerNorm(DIM, eps=1e-3)
 
-        self.agg_kk = SoftAgg(DIM)
-        self.agg_ij = SoftAgg(DIM)
+        self.agg_kk = SoftAggONNX(DIM)
+        self.agg_ij = SoftAggONNX(DIM)
 
         self.gru = nn.Sequential(
             nn.LayerNorm(DIM, eps=1e-3),
@@ -77,7 +77,9 @@ class Update(nn.Module):
         net = net + inp + self.corr(corr)
         net = self.norm(net)
 
-        ix, jx = fastba.neighbors(kk, jj)
+        # ix, jx = fastba.neighbors(kk, jj)
+        ix, jx = neighbors_tensor(kk, jj)
+    
         mask_ix = (ix >= 0).float().reshape(1, -1, 1)
         mask_jx = (jx >= 0).float().reshape(1, -1, 1)
 
@@ -271,3 +273,183 @@ class VONet(nn.Module):
 
         return traj
 
+        
+"""
+----------------------------------
+For convet to ONNX function
+-----------------------------------
+"""
+
+def neighbors_tensor(ii: torch.Tensor, jj: torch.Tensor):
+    """
+    Fully tensorized neighbors computation WITHOUT torch.unique (ONNX-compatible)
+    ii, jj: [N]  (group indices)
+    Returns:
+        ix, jx: previous and next neighbor indices, shape [N], always in [0, N-1]
+    """
+    ii = ii.reshape(-1)
+    jj = jj.reshape(-1)
+    N = ii.shape[0]
+
+    # Broadcast ii and jj to compare all pairs
+    ii_row = ii.unsqueeze(0).expand(N, N)
+    ii_col = ii.unsqueeze(1).expand(N, N)
+    jj_row = jj.unsqueeze(0).expand(N, N)
+    jj_col = jj.unsqueeze(1).expand(N, N)
+
+    # Mask to only allow neighbors in the same group
+    mask = ii_row == ii_col  # [N, N]
+
+    # Previous neighbor: jj_row < jj_col
+    prev_mask = mask & (jj_row < jj_col)
+    prev_jj = torch.where(prev_mask, jj_row, torch.full_like(jj_row, 0))
+    ix = torch.argmax(prev_jj, dim=1)
+    ix = torch.clamp(ix, min=0, max=N-1)  # ✅ clamp for CV28
+    
+
+    # Next neighbor: jj_row > jj_col
+    next_mask = mask & (jj_row > jj_col)
+    next_jj = torch.where(next_mask, jj_row, torch.full_like(jj_row, N))
+    jx = torch.argmin(next_jj, dim=1)
+    jx = torch.clamp(jx, min=0, max=N-1)  # ✅ clamp for CV28
+
+    return ix.to(torch.int64), jx.to(torch.int64)
+
+
+
+class SoftAggONNX(nn.Module):
+    def __init__(self, dim=512, expand=True):
+        super().__init__()
+        self.expand = expand
+        self.f = nn.Linear(dim, dim)
+        self.g = nn.Linear(dim, dim)
+        self.h = nn.Linear(dim, dim)
+
+    def forward(self, x, ix):
+        """
+        x  : [N, C] or [B, N, C]
+        ix : [N]  (sparse group indices, e.g., kk/ii/jj)
+        Returns:
+            - if expand=True: [N, C] or [B, N, C]
+            - else: [G, C] or [B, G, C], G = number of unique groups
+        """
+
+        is_batched = x.dim() == 3
+        device = x.device
+        dtype = x.dtype
+
+        # 1️⃣ compress group indices to 0..G-1
+        unique_ix, idx_map = torch.unique(ix, return_inverse=True)
+        G = unique_ix.numel()
+
+        # 2️⃣ compute projections
+        fx = self.f(x)
+        gx = self.g(x)
+
+        # 3️⃣ FP16-safe exponential
+        if dtype == torch.float16:
+            gx = torch.clamp(gx, -50.0, 50.0)
+        exp_gx = torch.exp(gx)
+
+        # 4️⃣ prepare group sum and output
+        if is_batched:
+            B, N, C = x.shape
+            denom = torch.zeros(B, G, C, device=device, dtype=dtype)
+            y = torch.zeros(B, G, C, device=device, dtype=dtype)
+
+            # iterate over batch dimension (small in DPVO)
+            for b in range(B):
+                # compute denominator per group
+                denom[b].index_add_(0, idx_map, exp_gx[b])
+                # compute weighted sum per group
+                y[b].index_add_(0, idx_map, fx[b] * (exp_gx[b] / denom[b, idx_map, :]))
+
+        else:  # [N, C]
+            N, C = x.shape
+            denom = torch.zeros(G, C, device=device, dtype=dtype)
+            y = torch.zeros(G, C, device=device, dtype=dtype)
+            denom.index_add_(0, idx_map, exp_gx)
+            y.index_add_(0, idx_map, fx * (exp_gx / denom[idx_map, :]))
+
+        # 5️⃣ final projection
+        y = self.h(y)
+
+        # 6️⃣ expand back if needed
+        if self.expand:
+            return y[:, idx_map, :] if is_batched else y[idx_map]
+
+        return y
+
+
+
+
+class UpdateONNX(nn.Module):
+    def __init__(self, p, export_onnx=False):
+        super(UpdateONNX, self).__init__()
+        self.c1 = nn.Sequential(nn.Linear(DIM, DIM), nn.ReLU(inplace=True), nn.Linear(DIM, DIM))
+        self.c2 = nn.Sequential(nn.Linear(DIM, DIM), nn.ReLU(inplace=True), nn.Linear(DIM, DIM))
+        self.norm = nn.LayerNorm(DIM, eps=1e-3)
+        self.agg_kk = SoftAggONNX(DIM)
+        self.agg_ij = SoftAggONNX(DIM)
+        self.export_onnx = export_onnx
+        self.gru = nn.Sequential(
+            nn.LayerNorm(DIM, eps=1e-3),
+            GatedResidual(DIM),
+            nn.LayerNorm(DIM, eps=1e-3),
+            GatedResidual(DIM),
+        )
+        self.corr = nn.Sequential(
+            nn.Linear(2*49*p*p, DIM),
+            nn.ReLU(inplace=True),
+            nn.Linear(DIM, DIM),
+            nn.LayerNorm(DIM, eps=1e-3),
+            nn.ReLU(inplace=True),
+            nn.Linear(DIM, DIM),
+        )
+        self.d = nn.Sequential(nn.ReLU(inplace=False), nn.Linear(DIM, 2), GradientClip())
+        self.w = nn.Sequential(nn.ReLU(inplace=False), nn.Linear(DIM, 2), GradientClip(), nn.Sigmoid())
+
+    def forward(self, net, inp, corr, ii, jj, kk):
+        # CV28 input reshape (4D -> 3D)
+        net  = net.squeeze(-1).permute(0, 2, 1)
+        inp  = inp.squeeze(-1).permute(0, 2, 1)
+        corr = corr.squeeze(-1).permute(0, 2, 1)
+
+        ii = ii.squeeze(0).squeeze(-1)
+        jj = jj.squeeze(0).squeeze(-1)
+        kk = kk.squeeze(0).squeeze(-1)
+
+        net = net + inp + self.corr(corr)
+        net = self.norm(net)
+
+        # compute neighbors
+        ix, jx = neighbors_tensor(kk, jj)
+
+        mask_ix = torch.ones_like(ix, dtype=net.dtype).view(1, -1, 1)  # use full mask
+        mask_jx = torch.ones_like(jx, dtype=net.dtype).view(1, -1, 1)
+
+        # clamp indices to [0, H-1] for CV28
+        ix = torch.clamp(ix, 0, net.shape[1]-1)
+        jx = torch.clamp(jx, 0, net.shape[1]-1)
+
+        # neighbor updates
+        net = net + self.c1(net[:, ix])
+        net = net + self.c2(net[:, jx])
+
+        # soft aggregation
+        net = net + self.agg_kk(net, kk)
+        net = net + self.agg_ij(net, ii*12345 + jj)
+
+        net = self.gru(net)
+
+        # outputs
+        d_out = self.d(net)
+        w_out = self.w(net)
+
+        if self.export_onnx:
+            net_out = net.permute(0, 2, 1).unsqueeze(-1)
+            d_out = d_out.permute(0, 2, 1).unsqueeze(-1)
+            w_out = w_out.permute(0, 2, 1).unsqueeze(-1)
+            return net_out, d_out, w_out
+
+        return net, (d_out, w_out, None)
