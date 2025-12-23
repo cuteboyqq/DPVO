@@ -104,24 +104,89 @@ class Update(nn.Module):
                     - weight: Confidence weights, shape [B, N, 2]
                     - None: Placeholder (for compatibility with other code)
         """
-        net = net + inp + self.corr(corr)
-        net = self.norm(net)
+        ONNX_COMPATIBLE = True
+        if not ONNX_COMPATIBLE:
+            net = net + inp + self.corr(corr)
+            net = self.norm(net)
 
-        # ix, jx = fastba.neighbors(kk, jj)
-        ix, jx = neighbors_tensor(kk, jj)
-    
-        mask_ix = (ix >= 0).float().reshape(1, -1, 1)
-        mask_jx = (jx >= 0).float().reshape(1, -1, 1)
+            # ix, jx = fastba.neighbors(kk, jj)
+            ix, jx = neighbors_tensor(kk, jj)
+        
+            mask_ix = (ix >= 0).float().reshape(1, -1, 1)
+            mask_jx = (jx >= 0).float().reshape(1, -1, 1)
 
-        net = net + self.c1(mask_ix * net[:,ix])
-        net = net + self.c2(mask_jx * net[:,jx])
+            net = net + self.c1(mask_ix * net[:,ix])
+            net = net + self.c2(mask_jx * net[:,jx])
 
-        net = net + self.agg_kk(net, kk)
-        net = net + self.agg_ij(net, ii*12345 + jj)
+            net = net + self.agg_kk(net, kk)
+            net = net + self.agg_ij(net, ii*12345 + jj)
 
-        net = self.gru(net)
+            net = self.gru(net)
+            
+            return net, (self.d(net), self.w(net), None)
+        else:
+            # CRITICAL: Ensure ii is used early to prevent ONNX from optimizing it away
+            # Convert to float and create a dependency that affects the computation
+            ii_float = ii.float()  # Convert to float for operations
+            # Create a minimal bias tensor from ii that gets added to net
+            # Use a very small but non-zero value to create dependency chain
+            ii_bias = (ii_float.sum() * 1e-10).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+            ii_bias = ii_bias.expand_as(net)  # [1, H, DIM]
+            # Add to net - this creates a dependency that ONNX cannot optimize away
+            net = net + inp + self.corr(corr) + ii_bias
+            net = self.norm(net)
 
-        return net, (self.d(net), self.w(net), None)
+            # compute neighbors
+            ix, jx = neighbors_tensor(kk, jj)
+
+            # mask_ix = torch.ones_like(ix, dtype=net.dtype).view(1, -1, 1)  # use full mask
+            # mask_jx = torch.ones_like(jx, dtype=net.dtype).view(1, -1, 1)
+
+            # clamp indices to [0, H-1] for CV28 to avoid negative indices
+            # AMBA CV28 doesn't handle negative indices correctly in Gather operations
+            H = net.shape[1]
+            ix = torch.clamp(ix, min=0, max=H-1)
+            jx = torch.clamp(jx, min=0, max=H-1)
+            
+            # Ensure indices are non-negative and valid (double-check for safety)
+            ix = torch.abs(ix)  # Ensure non-negative
+            jx = torch.abs(jx)  # Ensure non-negative
+            ix = torch.clamp(ix, min=0, max=H-1)
+            jx = torch.clamp(jx, min=0, max=H-1)
+
+            # neighbor updates
+            net = net + self.c1(net[:, ix])
+            net = net + self.c2(net[:, jx])
+
+            # soft aggregation
+            # Ensure ii is used to prevent ONNX from optimizing it away
+            # Create a dependency on ii that affects the computation
+            ii_used = ii.to(torch.int64)  # Ensure ii is processed
+            ii_used = torch.clamp(ii_used, min=0, max=net.shape[1]-1)  # Clamp to valid range
+            
+            net = net + self.agg_kk(net, kk)
+            # Use ii_used instead of ii directly to create a dependency chain
+            net = net + self.agg_ij(net, ii_used*12345 + jj)
+
+            net = self.gru(net)
+
+            # outputs
+            d_out = self.d(net)
+            w_out = self.w(net)
+            
+            # CRITICAL: Ensure ii affects outputs to prevent ONNX from optimizing it away
+            # Add minimal contribution based on ii to create dependency chain
+            # This ensures ONNX sees ii as required for the outputs
+            ii_final = ii.float().unsqueeze(0).unsqueeze(-1)  # [1, H, 1]
+            ii_scale = 1e-10  # Very small but non-zero to create dependency
+            
+            # Add tiny contribution to outputs based on ii
+            # This creates a dependency that ONNX cannot optimize away
+            d_out = d_out + (ii_final.expand(1, -1, 2) * ii_scale)
+            w_out = w_out + (ii_final.expand(1, -1, 2) * ii_scale)
+
+            return net, (d_out, w_out, None)
+        
 
 
 class Patchifier(nn.Module):
