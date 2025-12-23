@@ -71,9 +71,39 @@ class Update(nn.Module):
             nn.Sigmoid())
 
 
-    def forward(self, net, inp, corr, flow, ii, jj, kk):
-        """ update operator """
-
+    def forward(
+        self,
+        net: torch.Tensor,
+        inp: torch.Tensor,
+        corr: torch.Tensor,
+        flow: torch.Tensor,
+        ii: torch.Tensor,
+        jj: torch.Tensor,
+        kk: torch.Tensor
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, None]]:
+        """
+        Update operator for DPVO factor graph optimization.
+        Notes:
+            B is batch size (typically 1)
+            N is the number of edges/patches
+            DIM=384.
+        Args:
+            net: torch.Tensor - Network hidden state, shape [B, N, DIM]. Type: float32
+            inp: torch.Tensor - Input features (imap), shape [B, N, DIM]. Type: float32
+            corr: torch.Tensor - Correlation features, shape [B, N, corr_dim] where corr_dim = 2*49*p*p (882 for p=3). Type: float32
+            flow: torch.Tensor - Optical flow (currently not used in the forward pass but kept for API compatibility), shape [B, N, 2]. Type: float32
+            ii: torch.Tensor - Source frame indices, shape [N] or [B, N]. Type: int64
+            jj: torch.Tensor - Target frame indices, shape [N] or [B, N]. Type: int64
+            kk: torch.Tensor - Patch indices, shape [N] or [B, N]. Type: int64
+        
+        Returns:
+            tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, None]]:
+                - net: Updated network state, shape [B, N, DIM]
+                - (delta, weight, None): Tuple containing:
+                    - delta: Position correction (predicted deltas), shape [B, N, 2]
+                    - weight: Confidence weights, shape [B, N, 2]
+                    - None: Placeholder (for compatibility with other code)
+        """
         net = net + inp + self.corr(corr)
         net = self.norm(net)
 
