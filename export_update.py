@@ -307,6 +307,11 @@ def export_to_onnx(model, dummy_inputs, output_path, input_names, output_names, 
         
         # Post-process ONNX model to ensure static shapes
         print(f"  Post-processing ONNX model to fix output shapes...")
+        print(f"This does NOT change computation, only the declared tensor shapes in the ONNX graph.")
+        print(f"⚠️ CV28 requires fully static output shapes. So this block manually overwrites the ONNX graph’s output shape metadata using shapes observed from a real forward pass.")
+        print(f"Even when you export ONNX without dynamic_axes, PyTorch can still produce:")
+        print(f"    - outputs with unknown dimensions (dim_param, ?)")
+        print(f"    - or outputs missing shape info entirely")
         try:
             import onnx
             from onnx import helper
@@ -317,6 +322,12 @@ def export_to_onnx(model, dummy_inputs, output_path, input_names, output_names, 
             with torch.no_grad():
                 test_outputs = model(*dummy_inputs)
                 expected_shapes = {name: tuple(out.shape) for name, out in zip(output_names, test_outputs)}
+                # {
+                #     "net_out": (1, 128, 96),
+                #     "d_out":   (1, 96),
+                #     "w_out":   (1, 96)
+                # }
+
             
             # Fix output shapes to be static
             for i, output in enumerate(onnx_model.graph.output):
@@ -324,7 +335,7 @@ def export_to_onnx(model, dummy_inputs, output_path, input_names, output_names, 
                     expected_shape = expected_shapes[output.name]
                     print(f"    Fixing output '{output.name}' shape to {expected_shape}")
                     
-                    # Create new tensor type with static shape
+                    # Create new tensor type with static shape → create a new tensor type + shape descriptor
                     shape_proto = helper.make_tensor_value_info(
                         output.name,
                         output.type.tensor_type.elem_type,
