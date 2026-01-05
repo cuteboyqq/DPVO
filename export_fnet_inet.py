@@ -70,7 +70,7 @@ class INetWrapper(nn.Module):
 
 def load_dpvo_model(model_path):
     """Load DPVO model from checkpoint"""
-    print(f"Loading model from {model_path}...")
+    print(f"📥 Loading model from {model_path}...")
     
     state_dict = torch.load(model_path, map_location='cpu')
     new_state_dict = OrderedDict()
@@ -83,16 +83,16 @@ def load_dpvo_model(model_path):
     network.load_state_dict(new_state_dict)
     network.eval()
     
-    print("Model loaded successfully!")
+    print("✅ Model loaded successfully!")
     return network
 
 
 def export_to_onnx(model, input_shape, output_path, input_names, output_names, opset_version=11, static_shape=True):
     """Export PyTorch model to ONNX format with static shapes for AMBA CV28"""
-    print(f"\nExporting to {output_path}...")
-    print(f"  Input shape: {input_shape} (static: {static_shape})")
-    print(f"  Input names: {input_names}")
-    print(f"  Output names: {output_names}")
+    print(f"\n🚀 Exporting to {output_path}...")
+    print(f"  📊 Input shape: {input_shape} (static: {static_shape})")
+    print(f"  📥 Input names: {input_names}")
+    print(f"  📤 Output names: {output_names}")
     
     # Create dummy input
     dummy_input = torch.randn(*input_shape)
@@ -130,7 +130,7 @@ def export_to_onnx(model, input_shape, output_path, input_names, output_names, o
             verbose=False
         )
     
-    print(f"  ✓ Exported successfully to {output_path}")
+    print(f"  ✅ Exported successfully to {output_path} 🎉")
 
 
 def main():
@@ -143,7 +143,7 @@ def main():
                         help='Input image height (default: 480)')
     parser.add_argument('--width', type=int, default=640,
                         help='Input image width (default: 640)')
-    parser.add_argument('--num_frames', type=int, default=36,
+    parser.add_argument('--num_frames', type=int, default=1,
                         help='Number of frames in input (default: 36 for AMBA CV28)')
     parser.add_argument('--opset', type=int, default=11,
                         help='ONNX opset version (default: 11)')
@@ -164,23 +164,25 @@ def main():
     inet = model.patchify.inet
     
     print(f"\n{'='*60}")
-    print("Model Information:")
+    print("📋 Model Information:")
     print(f"{'='*60}")
-    print(f"FNet output_dim: 128")
-    print(f"INet output_dim: 384")
-    print(f"Input resolution: {args.height} x {args.width}")
-    print(f"Output resolution (after /4): {args.height//4} x {args.width//4}")
-    print(f"Number of frames: {args.num_frames}")
-    print(f"Static shapes: {args.static} (for AMBA CV28)")
+    print(f"  🔹 FNet output_dim: 128")
+    print(f"  🔹 INet output_dim: 384")
+    print(f"  📐 Input resolution: {args.height} x {args.width}")
+    print(f"  📐 Output resolution (after /4): {args.height//4} x {args.width//4}")
+    print(f"  🎬 Number of frames: {args.num_frames}")
+    print(f"  🔒 Static shapes: {args.static} (for AMBA CV28)")
     
     # Wrap models to include normalization
     # For AMBA CV28: use 4D input [N, 3, H, W] instead of 5D [B, N, 3, H, W]
+    print(f"\n🔧 Creating ONNX-compatible wrappers...")
     fnet_wrapped = FNetWrapper(fnet, num_frames=args.num_frames)
     inet_wrapped = INetWrapper(inet, num_frames=args.num_frames)
     
     # Set to eval mode
     fnet_wrapped.eval()
     inet_wrapped.eval()
+    print(f"  ✅ Wrappers created successfully")
     
     if args.static:
         # Static 4D input for AMBA CV28: [N, 3, H, W]
@@ -195,6 +197,7 @@ def main():
         output_imap_shape = (1, args.num_frames, 384, args.height//4, args.width//4)
     
     # Export fnet
+    print(f"\n📤 Exporting FNet model...")
     fnet_path = output_dir / "fnet.onnx"
     export_to_onnx(
         fnet_wrapped,
@@ -207,6 +210,7 @@ def main():
     )
     
     # Export inet
+    print(f"\n📤 Exporting INet model...")
     inet_path = output_dir / "inet.onnx"
     export_to_onnx(
         inet_wrapped,
@@ -219,25 +223,25 @@ def main():
     )
     
     print(f"\n{'='*60}")
-    print("Export Summary:")
+    print("📊 Export Summary:")
     print(f"{'='*60}")
-    print(f"✓ FNet exported to: {fnet_path}")
-    print(f"✓ INet exported to: {inet_path}")
-    print(f"\nInput format:")
+    print(f"  ✅ FNet exported to: {fnet_path}")
+    print(f"  ✅ INet exported to: {inet_path}")
+    print(f"\n📥 Input format:")
     if args.static:
-        print(f"  - Shape: [N, 3, H, W] = [{args.num_frames}, 3, {args.height}, {args.width}] (4D, static)")
+        print(f"  📐 Shape: [N, 3, H, W] = [{args.num_frames}, 3, {args.height}, {args.width}] (4D, static)")
     else:
-        print(f"  - Shape: [B, N, 3, H, W] = [1, {args.num_frames}, 3, {args.height}, {args.width}] (5D)")
-    print(f"  - Range: [-0.5, 0.5] (normalized from [0, 255])")
-    print(f"  - Formula: images = 2 * (images / 255.0) - 0.5")
-    print(f"\nOutput format:")
+        print(f"  📐 Shape: [B, N, 3, H, W] = [1, {args.num_frames}, 3, {args.height}, {args.width}] (5D)")
+    print(f"  🔢 Range: [-0.5, 0.5] (normalized from [0, 255])")
+    print(f"  📝 Formula: images = 2 * (images / 255.0) - 0.5")
+    print(f"\n📤 Output format:")
     if args.static:
-        print(f"  - FNet: [N, 128, H/4, W/4] = [{args.num_frames}, 128, {args.height//4}, {args.width//4}] (4D, static)")
-        print(f"  - INet: [N, 384, H/4, W/4] = [{args.num_frames}, 384, {args.height//4}, {args.width//4}] (4D, static)")
+        print(f"  🔹 FNet: [N, 128, H/4, W/4] = [{args.num_frames}, 128, {args.height//4}, {args.width//4}] (4D, static)")
+        print(f"  🔹 INet: [N, 384, H/4, W/4] = [{args.num_frames}, 384, {args.height//4}, {args.width//4}] (4D, static)")
     else:
-        print(f"  - FNet: [B, N, 128, H/4, W/4] = [1, {args.num_frames}, 128, {args.height//4}, {args.width//4}] (5D)")
-        print(f"  - INet: [B, N, 384, H/4, W/4] = [1, {args.num_frames}, 384, {args.height//4}, {args.width//4}] (5D)")
-    print(f"  - Both outputs are already divided by 4.0")
+        print(f"  🔹 FNet: [B, N, 128, H/4, W/4] = [1, {args.num_frames}, 128, {args.height//4}, {args.width//4}] (5D)")
+        print(f"  🔹 INet: [B, N, 384, H/4, W/4] = [1, {args.num_frames}, 384, {args.height//4}, {args.width//4}] (5D)")
+    print(f"  ⚠️  Both outputs are already divided by 4.0")
     print(f"{'='*60}\n")
 
 

@@ -22,7 +22,7 @@ os.makedirs(jj_out_dir, exist_ok=True)
 kk_out_dir = "./dummy/dummy_kk"
 os.makedirs(kk_out_dir, exist_ok=True)
 
-B, N, DIM = 1, 1024, 384
+B, N, DIM = 1, 768, 384
 p = 3
 
 # ---------------------------
