@@ -13,6 +13,144 @@ from pathlib import Path
 from dpvo.net import VONet, DIM
 from dpvo.blocks import GradientClip, GatedResidual
 from collections import OrderedDict
+import numpy as np
+
+
+
+class UpdateONNX_successul_on_AMBA(nn.Module):
+    def __init__(self, p, export_onnx=False, dim=384):
+        super(UpdateONNX, self).__init__()
+        self.DIM = dim
+        self.p = p
+        self.export_onnx = export_onnx
+        self.gap = nn.AdaptiveAvgPool2d((1, 1))
+        # create a dummy conv once
+        self.keep_conv = nn.Conv2d(1, 1, kernel_size=1, bias=False)
+        self.keep_conv.weight.data.zero_()
+        self.keep_conv.requires_grad_(False)
+
+        # -------------------------------
+        # CV28-friendly neighbor biases
+        # Use Conv1x1 instead of Linear
+        # -------------------------------
+        self.c1 = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim, dim, kernel_size=1),
+        )
+        self.c2 = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim, dim, kernel_size=1),
+        )
+
+        # -------------------------------
+        # Correlation head
+        # Linear → Conv1x1 for CV28
+        # -------------------------------
+        corr_channels = 2 * 49 * p * p
+        self.corr_conv = nn.Sequential(
+            nn.Conv2d(corr_channels, dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim, dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim, dim, 1),
+        )
+
+        # -------------------------------
+        # Output heads
+        # -------------------------------
+        self.d = nn.Sequential(
+            nn.ReLU(inplace=False),
+            nn.Conv2d(dim, 2, kernel_size=1),
+            # GradientClip()
+        )
+        self.w = nn.Sequential(
+            nn.ReLU(inplace=False),
+            nn.Conv2d(dim, 2, kernel_size=1),
+            # GradientClip(),
+            nn.Sigmoid()
+        )
+    def forward(self, net, inp, corr, ii, jj, kk):
+        # keep = ii.float().sum() + jj.float().sum() + kk.float().sum()
+        # net = net + keep * 0.0
+        
+        dummy_ii = self.keep_conv(ii)
+        dummy_jj = self.keep_conv(jj)
+        dummy_kk = self.keep_conv(kk)
+
+        net = net + (dummy_ii + dummy_jj + dummy_kk) * 0.0
+        
+        net = net + inp + self.corr_conv(corr)
+
+        # ❌ no GAP, no broadcast
+        net = net + self.c1(net) + self.c2(net)
+
+        d_out = self.d(net)
+        w_out = self.w(net)   # no sigmoid inside
+
+        return net, d_out, w_out
+
+    def forward_ori(self, net, inp, corr, ii, jj, kk):
+        """
+        Inputs:
+            net  : [B, DIM, H, 1]
+            inp  : [B, DIM, H, 1]
+            corr : [B, 2*49*p*p, H, 1]
+            ii,jj,kk: [1,1,H,1] int32 (kept as dummy in ONNX)
+        """
+        # -------------------------------
+        # Keep ii/jj/kk alive for ONNX
+        # -------------------------------
+        # keep_scalar = ii.float().sum() + jj.float().sum() + kk.float().sum()
+        # net = net + keep_scalar * 0.0
+        dummy = self.keep_conv(ii.float())
+        net = net + dummy * 0.0
+
+
+        # -------------------------------
+        # Main update trunk
+        # -------------------------------
+        net = net + inp + self.corr_conv(corr)
+
+        # -------------------------------
+        # Neighbor approximation (mean over H)
+        # -------------------------------
+        # net_mean = net.mean(dim=2, keepdim=True)  # [B,C,1,1] , the operataion will become ReduceMean that is not supported in AMBA CV28
+        net_mean = self.gap(net)  # [B, C, 1, 1] ✅ GlobalAveragePool
+        net = net + self.c1(net_mean) + self.c2(net_mean)
+    
+
+        # -------------------------------
+        # Output heads
+        # -------------------------------
+        d_out = self.d(net)
+        w_out = self.w(net)
+
+        # -------------------------------
+        # ONNX export layout: keep 4D
+        # -------------------------------
+        if self.export_onnx:
+            return net, d_out, w_out
+
+        return net, (d_out, w_out, None)
+
+
+#!/usr/bin/env python3
+"""
+Script to extract update model from DPVO and export to ONNX format with ONNX-compatible replacements.
+
+Usage:
+    python export_update.py --model dpvo.pth --output_dir ./onnx_models --max_edges 3000
+"""
+
+import torch
+import torch.nn as nn
+import argparse
+from pathlib import Path
+from dpvo.net import VONet, DIM
+from dpvo.blocks import GradientClip, GatedResidual
+from collections import OrderedDict
 
 
 def neighbors_tensor(ii: torch.Tensor, jj: torch.Tensor):
@@ -52,7 +190,7 @@ def neighbors_tensor(ii: torch.Tensor, jj: torch.Tensor):
 
 
 
-class SoftAggONNX(nn.Module):
+class SoftAggONNX_wrong_result(nn.Module):
     def __init__(self, dim=512, expand=True):
         super().__init__()
         self.expand = expand
@@ -95,6 +233,117 @@ class SoftAggONNX(nn.Module):
         
         return y
 
+class SoftAgg(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.f = nn.Linear(dim, dim)
+        self.g = nn.Linear(dim, dim)
+        self.h = nn.Linear(dim, dim)
+
+    def forward(self, x, ix):
+        """
+        x  : [1, H, C]
+        ix : [1, H] or [H]
+        """
+
+        if ix.dim() == 1:
+            ix = ix.unsqueeze(0)
+
+        B, H, C = x.shape
+        assert B == 1, "DPVO assumes batch size = 1"
+
+        fx = self.f(x)                    # [1, H, C]
+        gx = self.g(x)
+        gx = torch.clamp(gx, -50, 50)
+        w = torch.exp(gx)                 # [1, H, C]
+
+        ix0 = ix[0]                       # [H]
+
+        # ---- equality mask ----
+        # mask[h, k] = 1 if ix[h] == ix[k]
+        ix_i = ix0.unsqueeze(1)           # [H,1]
+        ix_j = ix0.unsqueeze(0)           # [1,H]
+        mask = (ix_i == ix_j).to(x.dtype) # [H,H]
+        mask = mask.unsqueeze(0).unsqueeze(-1)  # [1,H,H,1]
+
+        # ---- denominator ----
+        wj = w.unsqueeze(2)               # [1,H,1,C]
+        denom = torch.sum(mask * wj, dim=1)  # [1,H,C]
+        denom = torch.clamp(denom, min=1e-9)
+
+        # ---- weighted sum ----
+        wi = w / denom                    # [1,H,C]
+        fxj = fx.unsqueeze(2)             # [1,H,1,C]
+        y = torch.sum(mask * fxj * wi.unsqueeze(2), dim=1)
+
+        return self.h(y)
+
+
+
+class SoftAggONNX_ori(nn.Module):
+    def __init__(self, dim=512, expand=True):
+        super().__init__()
+        self.expand = expand
+        self.f = nn.Linear(dim, dim)
+        self.g = nn.Linear(dim, dim)
+        self.h = nn.Linear(dim, dim)
+
+    def forward(self, x, ix):
+        """
+        x  : [N, C] or [B, N, C]
+        ix : [N]  (sparse group indices, e.g., kk/ii/jj)
+        Returns:
+            - if expand=True: [N, C] or [B, N, C]
+            - else: [G, C] or [B, G, C], G = number of unique groups
+        """
+
+        is_batched = x.dim() == 3
+        device = x.device
+        dtype = x.dtype
+
+        # 1️⃣ compress group indices to 0..G-1
+        unique_ix, idx_map = torch.unique(ix, return_inverse=True)
+        G = unique_ix.numel()
+
+        # 2️⃣ compute projections
+        fx = self.f(x)
+        gx = self.g(x)
+
+        # 3️⃣ FP16-safe exponential
+        if dtype == torch.float16:
+            gx = torch.clamp(gx, -50.0, 50.0)
+        exp_gx = torch.exp(gx)
+
+        # 4️⃣ prepare group sum and output
+        if is_batched:
+            B, N, C = x.shape
+            denom = torch.zeros(B, G, C, device=device, dtype=dtype)
+            y = torch.zeros(B, G, C, device=device, dtype=dtype)
+
+            # iterate over batch dimension (small in DPVO)
+            for b in range(B):
+                # compute denominator per group
+                denom[b].index_add_(0, idx_map, exp_gx[b])
+                # compute weighted sum per group
+                y[b].index_add_(0, idx_map, fx[b] * (exp_gx[b] / denom[b, idx_map, :]))
+
+        else:  # [N, C]
+            N, C = x.shape
+            denom = torch.zeros(G, C, device=device, dtype=dtype)
+            y = torch.zeros(G, C, device=device, dtype=dtype)
+            denom.index_add_(0, idx_map, exp_gx)
+            y.index_add_(0, idx_map, fx * (exp_gx / denom[idx_map, :]))
+
+        # 5️⃣ final projection
+        y = self.h(y)
+
+        # 6️⃣ expand back if needed
+        if self.expand:
+            return y[:, idx_map, :] if is_batched else y[idx_map]
+
+        return y
+
+
 
 class UpdateONNX(nn.Module):
     def __init__(self, p, export_onnx=False):
@@ -102,8 +351,8 @@ class UpdateONNX(nn.Module):
         self.c1 = nn.Sequential(nn.Linear(DIM, DIM), nn.ReLU(inplace=True), nn.Linear(DIM, DIM))
         self.c2 = nn.Sequential(nn.Linear(DIM, DIM), nn.ReLU(inplace=True), nn.Linear(DIM, DIM))
         self.norm = nn.LayerNorm(DIM, eps=1e-3)
-        self.agg_kk = SoftAggONNX(DIM)
-        self.agg_ij = SoftAggONNX(DIM)
+        self.agg_kk = SoftAgg(DIM)
+        self.agg_ij = SoftAgg(DIM)
         self.export_onnx = export_onnx
         self.gru = nn.Sequential(
             nn.LayerNorm(DIM, eps=1e-3),
@@ -196,9 +445,13 @@ class UpdateONNX(nn.Module):
         ii_used = ii.to(torch.int64)  # Ensure ii is processed
         ii_used = torch.clamp(ii_used, min=0, max=net.shape[1]-1)  # Clamp to valid range
         
+        # net = net + self.agg_kk(net, kk)
+        # # Use ii_used instead of ii directly to create a dependency chain
+        # net = net + self.agg_ij(net, ii_used*12345 + jj)
+        
+        # soft aggregation with valid indices
         net = net + self.agg_kk(net, kk)
-        # Use ii_used instead of ii directly to create a dependency chain
-        net = net + self.agg_ij(net, ii_used*12345 + jj)
+        net = net + self.agg_ij(net, ii)  # <-- do NOT multiply or offset indices
 
         net = self.gru(net)
 
