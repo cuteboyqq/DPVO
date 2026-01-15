@@ -139,13 +139,13 @@ def main():
                         help='Path to DPVO model file (default: dpvo.pth)')
     parser.add_argument('--output_dir', type=str, default='./onnx_models',
                         help='Output directory for ONNX models (default: ./onnx_models)')
-    parser.add_argument('--height', type=int, default=480,
-                        help='Input image height (default: 480)')
-    parser.add_argument('--width', type=int, default=640,
-                        help='Input image width (default: 640)')
+    parser.add_argument('--height', type=int, default=528,
+                        help='Input image height (default: 528)')
+    parser.add_argument('--width', type=int, default=960,
+                        help='Input image width (default: 960)')
     parser.add_argument('--num_frames', type=int, default=1,
                         help='Number of frames in input (default: 36 for AMBA CV28)')
-    parser.add_argument('--opset', type=int, default=11,
+    parser.add_argument('--opset', type=int, default=12,
                         help='ONNX opset version (default: 11)')
     parser.add_argument('--static', action='store_true', default=True,
                         help='Export with static shapes for AMBA CV28 (default: True)')

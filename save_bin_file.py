@@ -22,7 +22,7 @@ os.makedirs(jj_out_dir, exist_ok=True)
 kk_out_dir = "./dummy/dummy_kk"
 os.makedirs(kk_out_dir, exist_ok=True)
 
-B, N, DIM = 1, 768, 384
+B, N, DIM = 1, 360, 384
 p = 3
 
 # ---------------------------
@@ -42,9 +42,14 @@ corr = np.random.randn(B, N, 2*49*p*p).astype(np.float32)
 corr.tofile(os.path.join(corr_out_dir, "corr.bin"))
 
 # indices (int64)
-ii = np.random.randint(0, 100, size=(N,), dtype=np.int32)
-jj = np.random.randint(0, 100, size=(N,), dtype=np.int32)
-kk = np.random.randint(0, 100, size=(N,), dtype=np.int32)
+# ii = np.random.randint(0, 100, size=(N,), dtype=np.int32)
+# jj = np.random.randint(0, 100, size=(N,), dtype=np.int32)
+# kk = np.random.randint(0, 100, size=(N,), dtype=np.int32)
+# If you want a different range, e.g., [0, 100):
+ii = (np.random.rand(N) * 100).astype(np.float32)
+jj = (np.random.rand(N) * 100).astype(np.float32)
+kk = (np.random.rand(N) * 100).astype(np.float32)
+
 
 ii.tofile(os.path.join(ii_out_dir, "ii.bin"))
 jj.tofile(os.path.join(jj_out_dir, "jj.bin"))

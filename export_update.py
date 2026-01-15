@@ -358,8 +358,7 @@ class UpdateONNX(nn.Module):
             nn.LayerNorm(DIM, eps=1e-3),
             GatedResidual(DIM),
             nn.LayerNorm(DIM, eps=1e-3),
-            GatedResidual(DIM),
-        )
+            GatedResidual(DIM),)
         self.corr = nn.Sequential(
             nn.Linear(2*49*p*p, DIM),
             nn.ReLU(inplace=True),
@@ -370,7 +369,7 @@ class UpdateONNX(nn.Module):
         )
         self.d = nn.Sequential(nn.ReLU(inplace=False), nn.Linear(DIM, 2), GradientClip())
         self.w = nn.Sequential(nn.ReLU(inplace=False), nn.Linear(DIM, 2), GradientClip(), nn.Sigmoid())
-
+        
     def forward(
         self,
         net: torch.Tensor,
@@ -408,13 +407,14 @@ class UpdateONNX(nn.Module):
         
         # CRITICAL: Ensure ii is used early to prevent ONNX from optimizing it away
         # Convert to float and create a dependency that affects the computation
-        ii_float = ii.float()  # Convert to float for operations
+        # ii_float = ii.float()  # Convert to float for operations
         # Create a minimal bias tensor from ii that gets added to net
         # Use a very small but non-zero value to create dependency chain
-        ii_bias = (ii_float.sum() * 1e-10).unsqueeze(0).unsqueeze(0).unsqueeze(0)
-        ii_bias = ii_bias.expand_as(net)  # [1, H, DIM]
+        # ii_bias = (ii_float.sum() * 1e-10).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+        # ii_bias = ii_bias.expand_as(net)  # [1, H, DIM]
         # Add to net - this creates a dependency that ONNX cannot optimize away
-        net = net + inp + self.corr(corr) + ii_bias
+        # net = net + inp + self.corr(corr) + ii_bias
+        net = net + inp + self.corr(corr)
         net = self.norm(net)
 
         # compute neighbors
@@ -639,7 +639,7 @@ def main():
                         help='Path to DPVO model file (default: dpvo.pth)')
     parser.add_argument('--output_dir', type=str, default='./onnx_models',
                         help='Output directory for ONNX models (default: ./onnx_models)')
-    parser.add_argument('--max_edges', type=int, default=768,
+    parser.add_argument('--max_edges', type=int, default=360,
                         help='Maximum number of edges (static shape for AMBA CV28, default: 3000)')
     parser.add_argument('--patch_size', type=int, default=3,
                         help='Patch size p (default: 3)')

@@ -1,7 +1,7 @@
 import os
 from multiprocessing import Process, Queue
 from pathlib import Path
-import time
+
 import cv2
 import numpy as np
 import torch
@@ -24,15 +24,6 @@ def show_image(image, t=0):
 @torch.no_grad()
 def run(cfg, network, imagedir, calib, stride=1, skip=0, viz=False, timeit=False):
 
-    # --- Metrics Initialization ---
-    if torch.cuda.is_available():
-        # Reset peak memory stats for a clean measurement of this run
-        torch.cuda.reset_peak_memory_stats()
-    
-    start_time = time.time()
-    frame_count = 0
-    # ------------------------------
-    
     slam = None
     queue = Queue(maxsize=8)
 
@@ -49,65 +40,36 @@ def run(cfg, network, imagedir, calib, stride=1, skip=0, viz=False, timeit=False
 
         image = torch.from_numpy(image).permute(2,0,1).cuda()
         intrinsics = torch.from_numpy(intrinsics).cuda()
+
         if slam is None:
             _, H, W = image.shape
-            print(f"H:{H}, W:{W}")
             slam = DPVO(cfg, network, ht=H, wd=W, viz=viz)
 
-       
-        # --- Core SLAM processing time for FPS calculation ---
-        frame_start_time = time.time()
         with Timer("SLAM", enabled=timeit):
             slam(t, image, intrinsics)
-        frame_count += 1
-        # ---------------------------------------------------
 
     reader.join()
-    
-    # --- Metrics Calculation and Reporting ---
-    total_time = time.time() - start_time
-    average_fps = frame_count / total_time if total_time > 0 else 0.0
-    
-    peak_gpu_mem_bytes = 0
-    if torch.cuda.is_available():
-        peak_gpu_mem_bytes = torch.cuda.max_memory_allocated()
-        # Convert bytes to Gigabytes (1024^3)
-        peak_gpu_mem_gb = peak_gpu_mem_bytes / (1024**3)
-    else:
-        peak_gpu_mem_gb = 0.0
-
-    print("--- DPVO Performance Metrics ---")
-    print(f"Total Frames Processed: {frame_count}")
-    print(f"Total Processing Time (excluding init): {total_time:.2f} s")
-    print(f"Average FPS: {average_fps:.2f}")
-    if torch.cuda.is_available():
-        print(f"Peak GPU Memory Allocated: {peak_gpu_mem_gb:.3f} GB")
-    print("---------------------------")
-    # ---------------------------------------
 
     points = slam.pg.points_.cpu().numpy()[:slam.m]
     colors = slam.pg.colors_.view(-1, 3).cpu().numpy()[:slam.m]
 
-    # return slam.terminate(), (points, colors, (*intrinsics, H, W))
-    return (slam.terminate(), (points, colors, (*intrinsics, H, W)), (average_fps, peak_gpu_mem_gb))
+    return slam.terminate(), (points, colors, (*intrinsics, H, W))
 
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--network', type=str, default='dpvo.pth',
-                        help='Path to PyTorch model (dpvo.pth) or directory containing ONNX models (fnet.onnx, inet.onnx, update.onnx)')
+    parser.add_argument('--network', type=str, default='dpvo.pth')
     parser.add_argument('--imagedir', type=str)
     parser.add_argument('--calib', type=str)
-    parser.add_argument('--name', type=str, help='name your run', default='DPVO demo')
+    parser.add_argument('--name', type=str, help='name your run', default='result')
     parser.add_argument('--stride', type=int, default=2)
     parser.add_argument('--skip', type=int, default=0)
     parser.add_argument('--config', default="config/default.yaml")
     parser.add_argument('--timeit', action='store_true')
     parser.add_argument('--viz', action="store_true")
     parser.add_argument('--plot', action="store_true")
-    parser.add_argument('--opts', nargs='+', default=[],
-                        help='Override config parameters. Examples: --opts MAX_EDGES 10000 LOOP_CLOSURE True')
+    parser.add_argument('--opts', nargs='+', default=[])
     parser.add_argument('--save_ply', action="store_true")
     parser.add_argument('--save_colmap', action="store_true")
     parser.add_argument('--save_trajectory', action="store_true")
@@ -119,17 +81,9 @@ if __name__ == '__main__':
     print("Running with config...")
     print(cfg)
 
-    (poses, tstamps), (points, colors, calib), (avg_fps, peak_gpu_mem) = run(cfg, args.network, args.imagedir, args.calib, args.stride, args.skip, args.viz, args.timeit)
+    (poses, tstamps), (points, colors, calib) = run(cfg, args.network, args.imagedir, args.calib, args.stride, args.skip, args.viz, args.timeit)
     trajectory = PoseTrajectory3D(positions_xyz=poses[:,:3], orientations_quat_wxyz=poses[:, [6, 3, 4, 5]], timestamps=tstamps)
 
-    
-    # Optional: You can print the metrics here again or save them to a file
-    print(f"\n--- Final Results for {args.name} ---")
-    print(f"Average FPS: **{avg_fps:.2f}**")
-    if torch.cuda.is_available():
-        print(f"Peak GPU Memory: **{peak_gpu_mem:.3f} GB**")
-    print("-------------------------------------")
-    
     if args.save_ply:
         save_ply(args.name, points, colors)
 
