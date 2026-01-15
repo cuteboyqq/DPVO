@@ -550,7 +550,7 @@ def corr_torch_forward(
 
 
 def corr_torch_forward_fp16(
-    fmap1, fmap2, coords, ii, jj, radius, chunk_size=512
+    fmap1, fmap2, coords, ii, jj, radius, chunk_size=128
 ):
     """
     FP16, chunked, GPU-friendly correlation for DPVO.
@@ -578,12 +578,12 @@ def corr_torch_forward_fp16(
     oy = oy.view(1, 1, D, D, 1, 1)
 
     # process in chunks
-    # for m0 in range(0, M, chunk_size):
+    for m0 in range(0, M, chunk_size):
     
-    MAX_PATCHES = 10000
-    m_start = max(0, M - MAX_PATCHES)
+    # MAX_PATCHES = 8000
+    # m_start = max(0, M - MAX_PATCHES)
 
-    for m0 in range(m_start, M, chunk_size):
+    # for m0 in range(m_start, M, chunk_size):
         m1 = min(m0 + chunk_size, M)
         
         mc = m1 - m0
@@ -627,24 +627,27 @@ def corr_torch_forward_fp16(
     dx = dx.half()
     dy = dy.half()
 
-    # out = (
-    #     (1 - dx) * (1 - dy) * corr[:, :, 0:D-1, 0:D-1]
-    #     + dx * (1 - dy)     * corr[:, :, 0:D-1, 1:D]
-    #     + (1 - dx) * dy     * corr[:, :, 1:D, 0:D-1]
-    #     + dx * dy           * corr[:, :, 1:D, 1:D]
-    # )
+
     out = torch.zeros(
         (B, M, D-1, D-1, H, W),
         device=corr.device,
         dtype=corr.dtype
     )
-    # only update recent patches
-    out[:, m_start:M] = (
-        (1 - dx[:, m_start:M]) * (1 - dy[:, m_start:M]) * corr[:, m_start:M, 0:D-1, 0:D-1]
-        + dx[:, m_start:M] * (1 - dy[:, m_start:M])     * corr[:, m_start:M, 0:D-1, 1:D  ]
-        + (1 - dx[:, m_start:M]) * dy[:, m_start:M]     * corr[:, m_start:M, 1:D  , 0:D-1]
-        + dx[:, m_start:M] * dy[:, m_start:M]           * corr[:, m_start:M, 1:D  , 1:D  ]
+    
+    out = (
+        (1 - dx) * (1 - dy) * corr[:, :, 0:D-1, 0:D-1]
+        + dx * (1 - dy)     * corr[:, :, 0:D-1, 1:D]
+        + (1 - dx) * dy     * corr[:, :, 1:D, 0:D-1]
+        + dx * dy           * corr[:, :, 1:D, 1:D]
     )
+    
+    # only update recent patches
+    # out[:, m_start:M] = (
+    #     (1 - dx[:, m_start:M]) * (1 - dy[:, m_start:M]) * corr[:, m_start:M, 0:D-1, 0:D-1]
+    #     + dx[:, m_start:M] * (1 - dy[:, m_start:M])     * corr[:, m_start:M, 0:D-1, 1:D  ]
+    #     + (1 - dx[:, m_start:M]) * dy[:, m_start:M]     * corr[:, m_start:M, 1:D  , 0:D-1]
+    #     + dx[:, m_start:M] * dy[:, m_start:M]           * corr[:, m_start:M, 1:D  , 1:D  ]
+    # )
 
     
     

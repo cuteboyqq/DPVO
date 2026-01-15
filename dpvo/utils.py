@@ -83,6 +83,18 @@ def set_depth(patches, depth):
     return patches
 
 def flatmeshgrid(*args, **kwargs):
+    """
+    flatmeshgrid() creates all combinations of two arrays:
+    # Example:
+        arr1 = [1, 2, 3]
+        arr2 = [10, 20]
+        result1, result2 = flatmeshgrid(arr1, arr2)
+
+        # Result:
+        # result1 = [1, 1, 2, 2, 3, 3]  # First array repeated
+        # result2 = [10, 20, 10, 20, 10, 20]  # Second array cycled
+        # Creates pairs: (1,10), (1,20), (2,10), (2,20), (3,10), (3,20)
+    """
     grid = torch.meshgrid(*args, **kwargs)
     return (x.reshape(-1) for x in grid)
 

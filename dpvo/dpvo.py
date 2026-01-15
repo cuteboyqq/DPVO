@@ -185,28 +185,147 @@ class DPVO:
             print(f"WARNING: {e}")
 
     def load_weights(self, network):
-        # load network from checkpoint file
+        # load network from checkpoint file or ONNX models
         if isinstance(network, str):
-            from collections import OrderedDict
-            state_dict = torch.load(network)
-            new_state_dict = OrderedDict()
-            for k, v in state_dict.items():
-                if "update.lmbda" not in k:
-                    new_state_dict[k.replace('module.', '')] = v
+            # Check if this is an ONNX model path (directory or specific ONNX file)
+            from pathlib import Path
+            network_path = Path(network)
             
-            self.network = VONet()
-            self.network.load_state_dict(new_state_dict)
+            # Check if it's a directory containing ONNX models or a single ONNX file
+            if network_path.is_dir():
+                # Directory containing ONNX models
+                fnet_path = network_path / "fnet.onnx"
+                inet_path = network_path / "inet.onnx"
+                update_path = network_path / "update.onnx"
+                
+                # Check if all ONNX models exist
+                if fnet_path.exists() and inet_path.exists() and update_path.exists():
+                    print(f"✓ Loading ONNX models from directory: {network_path}")
+                    print(f"  - fnet.onnx: {fnet_path}")
+                    print(f"  - inet.onnx: {inet_path}")
+                    print(f"  - update.onnx: {update_path}")
+                    from .onnx_inference import ONNXInference
+                    from .onnx_network import ONNXVONet
+                    
+                    onnx_inference = ONNXInference(
+                        fnet_path=str(fnet_path),
+                        inet_path=str(inet_path),
+                        update_path=str(update_path)
+                    )
+                    self.network = ONNXVONet(onnx_inference)
+                    self._loaded_checkpoint = f"ONNX models from {network_path}"
+                    print(f"✓ ONNX models loaded successfully. Using ONNXVONet for inference.")
+                else:
+                    # Fall back to PyTorch model loading
+                    missing = []
+                    if not fnet_path.exists():
+                        missing.append(f"fnet.onnx")
+                    if not inet_path.exists():
+                        missing.append(f"inet.onnx")
+                    if not update_path.exists():
+                        missing.append(f"update.onnx")
+                    print(f"⚠ ONNX models not found (missing: {', '.join(missing)}). Falling back to PyTorch model.")
+                    from collections import OrderedDict
+                    state_dict = torch.load(network_path / "dpvo.pth" if (network_path / "dpvo.pth").exists() else network, map_location='cpu')
+                    new_state_dict = OrderedDict()
+                    for k, v in state_dict.items():
+                        if "update.lmbda" not in k:
+                            new_state_dict[k.replace('module.', '')] = v
+                    
+                    self.network = VONet()
+                    self.network.load_state_dict(new_state_dict)
+                    self._loaded_checkpoint = network
+                    print(f"✓ PyTorch model loaded: {network}")
+            elif network_path.suffix == '.onnx':
+                # Single ONNX file - assume it's the update model, look for fnet/inet in same directory
+                parent_dir = network_path.parent
+                fnet_path = parent_dir / "fnet.onnx"
+                inet_path = parent_dir / "inet.onnx"
+                update_path = network_path
+                
+                if fnet_path.exists() and inet_path.exists() and update_path.exists():
+                    print(f"✓ Loading ONNX models from directory: {parent_dir}")
+                    print(f"  - fnet.onnx: {fnet_path}")
+                    print(f"  - inet.onnx: {inet_path}")
+                    print(f"  - update.onnx: {update_path}")
+                    from .onnx_inference import ONNXInference
+                    from .onnx_network import ONNXVONet
+                    
+                    onnx_inference = ONNXInference(
+                        fnet_path=str(fnet_path),
+                        inet_path=str(inet_path),
+                        update_path=str(update_path)
+                    )
+                    self.network = ONNXVONet(onnx_inference)
+                    self._loaded_checkpoint = f"ONNX models from {parent_dir}"
+                    print(f"✓ ONNX models loaded successfully. Using ONNXVONet for inference.")
+                else:
+                    raise FileNotFoundError(
+                        f"ONNX models not found. Expected:\n"
+                        f"  - {fnet_path}\n"
+                        f"  - {inet_path}\n"
+                        f"  - {update_path}"
+                    )
+            elif network_path.suffix == '.pth':
+                # PyTorch model file
+                print(f"✓ Loading PyTorch model: {network}")
+                from collections import OrderedDict
+                state_dict = torch.load(network, map_location='cpu')
+                new_state_dict = OrderedDict()
+                for k, v in state_dict.items():
+                    if "update.lmbda" not in k:
+                        new_state_dict[k.replace('module.', '')] = v
+                
+                self.network = VONet()
+                self.network.load_state_dict(new_state_dict)
+                self._loaded_checkpoint = network
+                print(f"✓ PyTorch model loaded successfully. Using VONet for inference.")
+            else:
+                # Try to load as PyTorch model
+                print(f"✓ Attempting to load as PyTorch model: {network}")
+                from collections import OrderedDict
+                state_dict = torch.load(network, map_location='cpu')
+                new_state_dict = OrderedDict()
+                for k, v in state_dict.items():
+                    if "update.lmbda" not in k:
+                        new_state_dict[k.replace('module.', '')] = v
+                
+                self.network = VONet()
+                self.network.load_state_dict(new_state_dict)
+                self._loaded_checkpoint = network
+                print(f"✓ PyTorch model loaded successfully. Using VONet for inference.")
 
         else:
             self.network = network
+            self._loaded_checkpoint = None
 
         # steal network attributes
         self.DIM = self.network.DIM
         self.RES = self.network.RES
         self.P = self.network.P
 
-        self.network.cuda()
-        self.network.eval()
+        # Only move to CUDA and set eval if it's a PyTorch model
+        if hasattr(self.network, 'cuda') and hasattr(self.network, 'eval'):
+            self.network.cuda()
+            self.network.eval()
+        
+        # Debug: Print which network type is being used
+        network_type = self.network.__class__.__name__
+        patchify_type = self.network.patchify.__class__.__name__
+        update_type = self.network.update.__class__.__name__
+        print(f"✓ Network initialized: {network_type}")
+        print(f"  - Patchify: {patchify_type}")
+        print(f"  - Update: {update_type}")
+        
+        # Store flag to indicate if using ONNX
+        # Check if it's ONNXVONet or if patchify/update are ONNX versions
+        self._using_onnx = (network_type == 'ONNXVONet' or 
+                           patchify_type == 'ONNXPatchifier' or 
+                           update_type == 'ONNXUpdate')
+        if self._using_onnx:
+            print(f"  → ONNX inference mode: ENABLED")
+        else:
+            print(f"  → ONNX inference mode: DISABLED (using PyTorch)")
 
     def start_viewer(self):
         from dpviewer import Viewer
@@ -242,6 +361,9 @@ class DPVO:
 
     @property
     def gmap(self):
+        # Contains patch features from the last pmem frames (circular buffer)
+        # Each frame contributes M patches
+        # Shape: [1, pmem*M, 128, 3, 3]
         return self.gmap_.view(1, self.pmem * self.M, 128, 3, 3)
 
     @property
@@ -295,19 +417,51 @@ class DPVO:
         return poses, tstamps
 
     def corr(self, coords, indicies=None):
+        """
+        Summary
+            gmap: patch features from multiple previous frames (circular buffer)
+            pyramid[0] and pyramid[1]: frame features from multiple previous frames (circular buffers)
+            Both are updated when a new frame arrives, but they retain features from older frames
+            Correlation matches patches from any frame in gmap against frame features from any frame in pyramid
+            This enables matching patches across multiple frames, not just the current one.
+        What it does:
+            - Computes correlation between patches and frames in the feature memory
+            - Returns a correlation volume
+            - Example:
+                - coords: [1, 1024, 3]
+                - indicies: (ii, jj)
+                - ii: [0, 1, 2, 3, 4]
+                - jj: [0, 1, 2, 3, 4]
+                - Returns: [1, 5, 1024]
+        Visual:
+            - coords: [1, 1024, 3]
+            - ii: [0, 1, 2, 3, 4]
+            - jj: [0, 1, 2, 3, 4]
+            - ii1: [0, 1, 2, 3, 4]
+            - jj1: [0, 1, 2, 3, 4]
+            - corr1: [1, 5, 1024]
+            - corr2: [1, 5, 1024]
+            - return: [1, 5, 2048]
+
+        """
         """ local correlation volume """
         if indicies is not None:
             ii, jj = indicies
         else:
             # Slice to active edges only
             num_active = self.pg.num_edges
-            ii = self.pg.kk[:num_active]
-            jj = self.pg.jj[:num_active]
-        
-        ii1 = ii % (self.M * self.pmem)
-        jj1 = jj % (self.mem)
+            ii = self.pg.kk[:num_active] # Patch indices
+            jj = self.pg.jj[:num_active] # Target frame indices
+        # Map to Feature Memory Indices 
+        ii1 = ii % (self.M * self.pmem)  # Selects patches from gmap (any frame in buffer)
+        jj1 = jj % (self.mem) # Selects frames from pyramid (any frame in buffer)
+        # ii1 selects which patches from gmap (can be from any frame in the buffer)
+        # jj1 selects which frames from pyramid (can be from any frame in the buffer)
+        # Notes: Both self.gmap and self.pyramid are circular buffers that store features from multiple frames, 
+        #        not just the current one.
         corr1 = altcorr.corr(self.gmap, self.pyramid[0], coords / 1, ii1, jj1, 3)
         corr2 = altcorr.corr(self.gmap, self.pyramid[1], coords / 4, ii1, jj1, 3)
+        
         return torch.stack([corr1, corr2], -1).view(1, len(ii), -1)
 
     def reproject(self, indicies=None):
@@ -418,7 +572,6 @@ class DPVO:
         kk = torch.arange(self.m-self.M, self.m, device="cuda")
         jj = self.n * torch.ones_like(kk)
         ii = self.ix[kk]
-
         net = torch.zeros(1, len(ii), self.DIM, **self.kwargs)
         coords = self.reproject(indicies=(ii, jj, kk))
 
@@ -587,6 +740,37 @@ class DPVO:
                 print(f"[PG ACTIVE EDGES] {self.pg.num_edges}/{self.pg.max_edges}")
                 self._last_num_edges = self.pg.num_edges
     
+    # Alister add 2026-01-08
+    def make_idx_map(self, ix: torch.Tensor) -> tuple[torch.Tensor, int]:
+        """
+        Generate CV28-compatible compressed index map and group count.
+
+        Args:
+            ix: torch.Tensor of shape [N] or [B, N], dtype=int64
+                Original indices (e.g., kk, or ii*12345+jj)
+
+        Returns:
+            idx_map: torch.Tensor of shape [N] or [B, N], dtype=int64
+                    Values compressed to 0..G-1
+            G: int, number of unique groups
+        """
+        if ix.dim() == 2:
+            # batch case [B, N]
+            idx_map_list = []
+            G_list = []
+            for b in range(ix.shape[0]):
+                unique, inverse = torch.unique(ix[b], sorted=True, return_inverse=True)
+                idx_map_list.append(inverse.to(torch.int64))
+                G_list.append(unique.numel())
+            idx_map = torch.stack(idx_map_list, dim=0)
+            G = max(G_list)  # take max group count across batch
+            return idx_map, G
+        elif ix.dim() == 1:
+            unique, inverse = torch.unique(ix, sorted=True, return_inverse=True)
+            return inverse.to(torch.int64), unique.numel()
+        else:
+            raise ValueError(f"Unsupported ix shape {ix.shape}")
+
     
     def update(self):
         num_active = self.pg.num_edges
@@ -596,7 +780,9 @@ class DPVO:
         with Timer("other", enabled=self.enable_timing):
             coords = self.reproject()
 
-            with autocast(enabled=True):
+            with autocast(enabled=self.cfg.MIXED_PRECISION and not self._using_onnx):
+                # ONNX models don't need autocast (they handle precision internally)
+                # Only use autocast for PyTorch models
                 self._check_pg_static_shape()
                 corr = self.corr(coords)
                 # Slice to active edges only
@@ -607,6 +793,9 @@ class DPVO:
                 
                 # Slice net to active edges for update
                 active_net = self.pg.net[:, :num_active]
+      
+                # This will call ONNXUpdate.update_forward() if ONNXVONet is loaded
+                # or Update.forward() if VONet is loaded
                 active_net, (delta, weight, _) = \
                     self.network.update(active_net, ctx, corr, None, active_ii, active_jj, active_kk)
                 # Write back to full tensor
@@ -727,7 +916,12 @@ class DPVO:
 
         image = 2 * (image[None,None] / 255.0) - 0.5
         
-        with autocast(enabled=self.cfg.MIXED_PRECISION):
+        # Use ONNX inference if ONNX models are loaded, otherwise use PyTorch
+        # Note: self.network.patchify will automatically use ONNXPatchifier if ONNXVONet is loaded
+        # or Patchifier if VONet is loaded
+        with autocast(enabled=self.cfg.MIXED_PRECISION and not self._using_onnx):
+            # ONNX models don't need autocast (they handle precision internally)
+            # Only use autocast for PyTorch models
             fmap, gmap, imap, patches, _, clr = \
                 self.network.patchify(image,
                     patches_per_image=self.cfg.PATCHES_PER_FRAME, 
@@ -776,7 +970,8 @@ class DPVO:
         self.fmap1_[:, self.n % self.mem] = F.avg_pool2d(fmap[0], 1, 1)
         self.fmap2_[:, self.n % self.mem] = F.avg_pool2d(fmap[0], 4, 4)
 
-        self.counter += 1        
+        self.counter += 1
+        # Alister try noted 2026-01-08        
         if self.n > 0 and not self.is_initialized:
             if self.motion_probe() < 2.0:
                 self.pg.delta[self.counter - 1] = (self.counter - 2, Id[0])

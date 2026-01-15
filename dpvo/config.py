@@ -35,4 +35,10 @@ _C.CLASSIC_LOOP_CLOSURE = False
 _C.LOOP_CLOSE_WINDOW_SIZE = 3
 _C.LOOP_RETR_THRESH = 0.04
 
+# Static shape support for AMBA CV28 (max number of edges/factors)
+# Calculated as: (PATCH_LIFETIME * PATCHES_PER_FRAME * 2 * OPTIMIZATION_WINDOW) + loop_closure_edges
+# Default: (12 * 80 * 2 * 12) + 2000 = 23040 + 2000 = 25040
+# For smaller configs: (6 * 24 * 2 * 5) + 1000 = 1440 + 1000 = 2440
+_C.MAX_EDGES = 10000  # Conservative default, can be increased if needed
+
 cfg = _C

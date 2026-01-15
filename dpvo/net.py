@@ -252,35 +252,35 @@ class Update(nn.Module):
                     - None: Placeholder (for compatibility with other code)
         """
         ONNX_COMPATIBLE = True
-        if not ONNX_COMPATIBLE:
-            net = net + inp + self.corr(corr)
-            net = self.norm(net)
+        # if not ONNX_COMPATIBLE:
+            # net = net + inp + self.corr(corr)
+            # net = self.norm(net)
 
-            # ix, jx = fastba.neighbors(kk, jj)
-            ix, jx = neighbors_tensor(kk, jj)
+            # # ix, jx = fastba.neighbors(kk, jj)
+            # ix, jx = neighbors_tensor(kk, jj)
         
-            mask_ix = (ix >= 0).float().reshape(1, -1, 1)
-            mask_jx = (jx >= 0).float().reshape(1, -1, 1)
+            # mask_ix = (ix >= 0).float().reshape(1, -1, 1)
+            # mask_jx = (jx >= 0).float().reshape(1, -1, 1)
 
-            net = net + self.c1(mask_ix * net[:,ix])
-            net = net + self.c2(mask_jx * net[:,jx])
+            # net = net + self.c1(mask_ix * net[:,ix])
+            # net = net + self.c2(mask_jx * net[:,jx])
 
-            net = net + self.agg_kk(net, kk)
-            net = net + self.agg_ij(net, ii*12345 + jj)
+            # net = net + self.agg_kk(net, kk)
+            # net = net + self.agg_ij(net, ii*12345 + jj)
 
-            net = self.gru(net)
+            # net = self.gru(net)
             
-            return net, (self.d(net), self.w(net), None)
-        else:
+            # return net, (self.d(net), self.w(net), None)
+        if ONNX_COMPATIBLE:
             # CRITICAL: Ensure ii is used early to prevent ONNX from optimizing it away
             # Convert to float and create a dependency that affects the computation
-            ii_float = ii.float()  # Convert to float for operations
+            # ii_float = ii.float()  # Convert to float for operations
             # Create a minimal bias tensor from ii that gets added to net
             # Use a very small but non-zero value to create dependency chain
-            ii_bias = (ii_float.sum() * 1e-10).unsqueeze(0).unsqueeze(0).unsqueeze(0)
-            ii_bias = ii_bias.expand_as(net)  # [1, H, DIM]
+            # ii_bias = (ii_float.sum() * 1e-10).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+            # ii_bias = ii_bias.expand_as(net)  # [1, H, DIM]
             # Add to net - this creates a dependency that ONNX cannot optimize away
-            net = net + inp + self.corr(corr) + ii_bias
+            net = net + inp + self.corr(corr) # + ii_bias
             net = self.norm(net)
 
             # compute neighbors
@@ -308,8 +308,8 @@ class Update(nn.Module):
             # soft aggregation
             # Ensure ii is used to prevent ONNX from optimizing it away
             # Create a dependency on ii that affects the computation
-            ii_used = ii.to(torch.int64)  # Ensure ii is processed
-            ii_used = torch.clamp(ii_used, min=0, max=net.shape[1]-1)  # Clamp to valid range
+            # ii_used = ii.to(torch.int32)  # Ensure ii is processed
+            # ii_used = torch.clamp(ii_used, min=0, max=net.shape[1]-1)  # Clamp to valid range
             
             # net = net + self.agg_kk(net, kk)
             # # Use ii_used instead of ii directly to create a dependency chain
@@ -329,7 +329,7 @@ class Update(nn.Module):
             # Add minimal contribution based on ii to create dependency chain
             # This ensures ONNX sees ii as required for the outputs
             ii_final = ii.float().unsqueeze(0).unsqueeze(-1)  # [1, H, 1]
-            ii_scale = 1e-10  # Very small but non-zero to create dependency
+            ii_scale = 1e-10 # 1e-16  # Very small but non-zero to create dependency
             
             # Add tiny contribution to outputs based on ii
             # This creates a dependency that ONNX cannot optimize away
@@ -362,6 +362,7 @@ class Patchifier(nn.Module):
         imap = self.inet(images) / 4.0
 
         b, n, c, h, w = fmap.shape
+        print(f"fmap.shape :{b},{n},{c},{h},{w}")
         P = self.patch_size
 
         # bias patch selection towards regions with high gradient
@@ -668,11 +669,8 @@ class SoftAggCV28Exact(nn.Module):
 
 
 class SoftAggONNX(nn.Module):
-    def __init__(self, dim, H):
+    def __init__(self, dim):
         super().__init__()
-        self.dim = dim
-        self.H = H
-
         self.f = nn.Linear(dim, dim)
         self.g = nn.Linear(dim, dim)
         self.h = nn.Linear(dim, dim)
@@ -680,44 +678,43 @@ class SoftAggONNX(nn.Module):
     def forward(self, x, ix):
         """
         x  : [1, H, C]
-        ix : [1, H]   (int32 / int64)
+        ix : [1, H] or [H]
         """
 
-        B, H, C = x.shape
-        assert B == 1
-        device, dtype = x.device, x.dtype
+        if ix.dim() == 1:
+            ix = ix.unsqueeze(0)
 
-        fx = self.f(x)          # [1, H, C]
+        B, H, C = x.shape
+        assert B == 1, "DPVO assumes batch size = 1"
+
+        fx = self.f(x)                    # [1, H, C]
         gx = self.g(x)
         gx = torch.clamp(gx, -50, 50)
-        w = torch.exp(gx)       # [1, H, C]
+        w = torch.exp(gx)                 # [1, H, C]
 
-        # ---- build equality mask ----
+        ix0 = ix[0]                       # [H]
+
+        # ---- equality mask ----
         # mask[h, k] = 1 if ix[h] == ix[k]
-        ix0 = ix[0]                             # [H]
-        ix_i = ix0.unsqueeze(1)                 # [H,1]
-        ix_j = ix0.unsqueeze(0)                 # [1,H]
-        mask = (ix_i == ix_j).to(dtype)         # [H,H]
-
+        ix_i = ix0.unsqueeze(1)           # [H,1]
+        ix_j = ix0.unsqueeze(0)           # [1,H]
+        mask = (ix_i == ix_j).to(x.dtype) # [H,H]
         mask = mask.unsqueeze(0).unsqueeze(-1)  # [1,H,H,1]
 
-        # ---- soft weights ----
-        wj = w.unsqueeze(2)                     # [1,H,1,C]
-        denom = torch.sum(mask * wj, dim=1)     # [1,H,C]
+        # ---- denominator ----
+        wj = w.unsqueeze(2)               # [1,H,1,C]
+        denom = torch.sum(mask * wj, dim=1)  # [1,H,C]
         denom = torch.clamp(denom, min=1e-9)
 
-        wi = w / denom                          # [1,H,C]
-
-        # ---- aggregate ----
-        fxj = fx.unsqueeze(2)                   # [1,H,1,C]
+        # ---- weighted sum ----
+        wi = w / denom                    # [1,H,C]
+        fxj = fx.unsqueeze(2)             # [1,H,1,C]
         y = torch.sum(mask * fxj * wi.unsqueeze(2), dim=1)
 
         return self.h(y)
 
 
-
-
-class SoftAggONNX(nn.Module):
+class SoftAggONNX_ori(nn.Module):
     def __init__(self, dim=512, expand=True):
         super().__init__()
         self.expand = expand

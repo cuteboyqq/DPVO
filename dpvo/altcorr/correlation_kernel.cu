@@ -133,6 +133,8 @@ __global__ void corr_forward_kernel(int R,
     Step 3: Get Feature Indices 
              Selects which patch and frame to correlate.
     """
+    // us[m] → source PATCH index (which patch / keyframe)
+    // vs[m] → target FRAME index (which image to sample)
     const int ix = us[m]; // Which patch from fmap1 to use
     const int jx = vs[m]; // Which frame from fmap2 to use
 
@@ -159,6 +161,7 @@ __global__ void corr_forward_kernel(int R,
 
       #pragma unroll 8
       for (int i=0; i<C; i+=8) {
+        // “How similar does this patch pixel look compared to this candidate location in the target frame?”
         scalar_t f1[8]; for (int j=0; j<8; j++) f1[j] = fmap1[n][ix][i+j][i0][j0];
         scalar_t f2[8]; for (int j=0; j<8; j++) f2[j] = fmap2[n][jx][i+j][i1][j1];
 
